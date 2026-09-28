@@ -13,7 +13,10 @@ jobs:
     env:                    # credenciales tomadas de los secrets del repositorio
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
       BQ_PROYECTO: ${{ secrets.BQ_PROYECTO }}
-      BQ_DATASET: monitoreo_nino
+      # Nombres configurables desde Settings > Secrets and variables > Actions > Variables
+      # (si la variable no existe, se usa el valor por defecto)
+      BQ_DATASET: ${{ vars.BQ_DATASET || 'monitoreo_nino' }}
+      BQ_TABLA_ICEN: ${{ vars.BQ_TABLA_ICEN || 'icen' }}
     steps:
       - uses: actions/checkout@v4          # 1. descarga tu código
       - uses: actions/setup-python@v5      # 2. instala Python
