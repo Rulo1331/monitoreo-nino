@@ -14,7 +14,9 @@ Uso:
   python icen.py --validar             # compara con valores oficiales conocidos
 
 Destino de los datos:
-  - Si existe la variable BQ_PROYECTO  -> BigQuery (tabla <BQ_PROYECTO>.<BQ_DATASET>.icen)
+  - Si existe la variable BQ_PROYECTO  -> BigQuery (tabla <BQ_PROYECTO>.<BQ_DATASET>.<BQ_TABLA_ICEN>)
+      BQ_DATASET    (opcional, por defecto 'monitoreo_nino'; admite 'otro_proyecto.dataset')
+      BQ_TABLA_ICEN (opcional, por defecto 'icen')
       Credenciales: GCP_SA_KEY (contenido JSON, usado en GitHub Actions) o
       GOOGLE_APPLICATION_CREDENTIALS (ruta al archivo JSON, usado en tu PC).
   - Si no existe                       -> SQLite local 'datos_nino.db' (pruebas).
@@ -25,7 +27,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-URL_NOAA = ("https://www.cpc.ncep.noaa.gov/products/GODAS/multiora/index/mnth.ersstv5.clim19912020.nino_current.txt")
+URL_NOAA = ("https://www.cpc.ncep.noaa.gov/products/GODAS/multiora/index/"
+            "mnth.ersstv5.clim19912020.nino_current.txt")
 FILA = re.compile(r"^\s*(\d{4})\s+(\d{1,2})\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
 
 # Valores oficiales publicados, para validar el cálculo (fuente: Informe Técnico ENFEN 06-2026)
@@ -123,6 +126,46 @@ def cliente_bigquery(proyecto):
     return bigquery.Client(project=proyecto)  # tu PC: usa GOOGLE_APPLICATION_CREDENTIALS
 
 
+def destino_bigquery(proyecto):
+    """Arma la ruta de la tabla a partir de variables de entorno.
+    BQ_DATASET acepta 'dataset' (mismo proyecto) o 'otro_proyecto.dataset'."""
+    ds = os.getenv("BQ_DATASET") or "monitoreo_nino"
+    ref_dataset = ds if "." in ds else f"{proyecto}.{ds}"
+    tabla = os.getenv("BQ_TABLA_ICEN") or "icen"
+    return ref_dataset, f"{ref_dataset}.{tabla}"
+
+
+def verificar_dataset(cliente, ref_dataset):
+    """Comprueba que el dataset exista y, si no, muestra qué datasets hay en ese proyecto."""
+    from google.api_core.exceptions import NotFound
+    try:
+        return cliente.get_dataset(ref_dataset)
+    except NotFound:
+        proyecto_ds, nombre = ref_dataset.split(".", 1)
+        existentes = [d.dataset_id for d in cliente.list_datasets(proyecto_ds)]
+        print(f"\nERROR: no existe el dataset '{nombre}' en el proyecto indicado.")
+        print(f"Datasets que SÍ existen en ese proyecto: {existentes or 'ninguno'}")
+        print("Revisa BQ_PROYECTO (ID, no nombre) y la variable BQ_DATASET.")
+        sys.exit(1)
+
+
+def verificar_tabla_ajena(cliente, tabla, esquema):
+    """Protección: no sobrescribir una tabla existente que tenga otra estructura
+    (por ejemplo, una tabla creada por otra persona con el mismo nombre)."""
+    from google.api_core.exceptions import NotFound
+    try:
+        existente = cliente.get_table(tabla)
+    except NotFound:
+        return  # no existe: se creará
+    esperadas = {c.name for c in esquema}
+    actuales = {c.name for c in existente.schema}
+    if actuales != esperadas:
+        print(f"\nERROR: la tabla '{tabla}' ya existe con otra estructura y NO se sobrescribirá.")
+        print(f"Columnas actuales: {sorted(actuales)}")
+        print("Usa otro nombre de tabla en la variable BQ_TABLA_ICEN.")
+        sys.exit(1)
+
+
 def guardar(df):
     df = df.dropna(subset=["anom_nino12"]).copy()
     proyecto = os.getenv("BQ_PROYECTO")
@@ -132,7 +175,7 @@ def guardar(df):
         return "SQLite local 'datos_nino.db'"
 
     from google.cloud import bigquery
-    tabla = f"{proyecto}.{os.getenv('BQ_DATASET', 'monitoreo_nino')}.icen"
+    ref_dataset, tabla = destino_bigquery(proyecto)
     esquema = [
         bigquery.SchemaField("anio", "INT64"), bigquery.SchemaField("mes", "INT64"),
         bigquery.SchemaField("anom_nino12", "FLOAT64"), bigquery.SchemaField("icen", "FLOAT64"),
@@ -140,10 +183,14 @@ def guardar(df):
         bigquery.SchemaField("anom_nino34", "FLOAT64"), bigquery.SchemaField("fuente", "STRING"),
         bigquery.SchemaField("actualizado_en", "TIMESTAMP"),
     ]
+    cliente = cliente_bigquery(proyecto)
+    dataset = verificar_dataset(cliente, ref_dataset)
+    verificar_tabla_ajena(cliente, tabla, esquema)
     # WRITE_TRUNCATE reemplaza la tabla completa: absorbe las revisiones de NOAA sin duplicar filas
     config = bigquery.LoadJobConfig(schema=esquema, write_disposition="WRITE_TRUNCATE")
-    cliente = cliente_bigquery(proyecto)
-    cliente.load_table_from_dataframe(df, tabla, job_config=config).result()
+    # La carga se ejecuta en la misma ubicación del dataset (US, southamerica-west1, etc.)
+    cliente.load_table_from_dataframe(df, tabla, job_config=config,
+                                      location=dataset.location).result()
     return f"BigQuery {tabla} ({cliente.get_table(tabla).num_rows} filas)"
 
 
@@ -164,4 +211,3 @@ if __name__ == "__main__":
             sys.exit(1)
     if not a.sin_guardar:
         print(f"\nGuardado en: {guardar(datos)}")
-
