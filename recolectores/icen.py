@@ -25,8 +25,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-URL_NOAA = ("https://www.cpc.ncep.noaa.gov/products/GODAS/multiora/index/"
-            "mnth.ersstv5.clim19912020.nino_current.txt")
+URL_NOAA = ("https://www.cpc.ncep.noaa.gov/products/GODAS/multiora/index/mnth.ersstv5.clim19912020.nino_current.txt")
 FILA = re.compile(r"^\s*(\d{4})\s+(\d{1,2})\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
 
 # Valores oficiales publicados, para validar el cálculo (fuente: Informe Técnico ENFEN 06-2026)
