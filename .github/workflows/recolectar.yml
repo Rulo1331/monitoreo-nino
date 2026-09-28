@@ -4,7 +4,8 @@ name: Recolectar datos El Niño
 
 on:
   schedule:
-    - cron: "0 12 * * 1"   # cada lunes 12:00 UTC = 07:00 hora de Perú
+    - cron: "0 12 * * 2"   # cada martes 12:00 UTC = 07:00 hora de Perú
+                           # (NOAA publica los datos semanales los lunes)
   workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
 
 jobs:
@@ -17,6 +18,8 @@ jobs:
       # (si la variable no existe, se usa el valor por defecto)
       BQ_DATASET: ${{ vars.BQ_DATASET || 'monitoreo_nino' }}
       BQ_TABLA_ICEN: ${{ vars.BQ_TABLA_ICEN || 'icen' }}
+      BQ_TABLA_SEMANAL: ${{ vars.BQ_TABLA_SEMANAL || 'nino_semanal' }}
+      BQ_TABLA_RONI: ${{ vars.BQ_TABLA_RONI || 'roni' }}
     steps:
       - uses: actions/checkout@v4          # 1. descarga tu código
       - uses: actions/setup-python@v5      # 2. instala Python
@@ -25,4 +28,7 @@ jobs:
       - run: pip install -r requirements.txt   # 3. instala librerías
       - name: ICEN (variable 1)                # 4. ejecuta cada recolector
         run: python recolectores/icen.py --validar
+      - name: Regiones Niño semanal + RONI (variable 2)
+        if: always()                         # corre aunque falle el paso anterior
+        run: python recolectores/nino_semanal_roni.py --validar
       # Aquí iremos agregando un paso por cada nueva variable
