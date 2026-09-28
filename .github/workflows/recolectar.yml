@@ -1,1 +1,25 @@
+# Ubicación en el repositorio: .github/workflows/recolectar.yml
+# Le dice a GitHub CUÁNDO y CÓMO ejecutar los recolectores en sus servidores.
+name: Recolectar datos El Niño
 
+on:
+  schedule:
+    - cron: "0 12 * * 1"   # cada lunes 12:00 UTC = 07:00 hora de Perú
+  workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
+
+jobs:
+  recolectar:
+    runs-on: ubuntu-latest
+    env:                    # credenciales tomadas de los secrets del repositorio
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      BQ_PROYECTO: ${{ secrets.BQ_PROYECTO }}
+      BQ_DATASET: monitoreo_nino
+    steps:
+      - uses: actions/checkout@v4          # 1. descarga tu código
+      - uses: actions/setup-python@v5      # 2. instala Python
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt   # 3. instala librerías
+      - name: ICEN (variable 1)                # 4. ejecuta cada recolector
+        run: python recolectores/icen.py --validar
+      # Aquí iremos agregando un paso por cada nueva variable
