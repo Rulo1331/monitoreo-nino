@@ -12,6 +12,7 @@ jobs:
   recolectar:
     runs-on: ubuntu-latest
     env:                    # credenciales tomadas de los secrets del repositorio
+      PYTHONUNBUFFERED: "1"   # muestra los mensajes en orden y en el momento
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
       BQ_PROYECTO: ${{ secrets.BQ_PROYECTO }}
       # Nombres configurables desde Settings > Secrets and variables > Actions > Variables
