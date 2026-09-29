@@ -24,8 +24,8 @@ jobs:
       BQ_TABLA_TSM: ${{ vars.BQ_TABLA_TSM || 'tsm_costera' }}
       BQ_TABLA_TSM_CLIMA: ${{ vars.BQ_TABLA_TSM_CLIMA || 'tsm_costera_clima' }}
     steps:
-      - uses: actions/checkout@v4          # 1. descarga tu código
-      - uses: actions/setup-python@v5      # 2. instala Python
+      - uses: actions/checkout@v5          # 1. descarga tu código
+      - uses: actions/setup-python@v6      # 2. instala Python
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt   # 3. instala librerías
