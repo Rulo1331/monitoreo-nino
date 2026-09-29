@@ -294,15 +294,21 @@ def validar(datos):
     for punto, g in datos.groupby("punto"):
         ultimo = g["fecha"].max()
         reciente = g[g["fecha"] > ultimo - timedelta(days=365)]
-        dif = (reciente["anom_1991_2020"] - reciente["anom_noaa_1971_2000"]).dropna()
+        par = reciente[["anom_1991_2020", "anom_noaa_1971_2000"]].dropna()
+        # Nuestra anomalía y la de NOAA deben SUBIR Y BAJAR JUNTAS (alta correlación).
+        # Su diferencia media puede ser de 1-2 °C cerca de la costa: la climatología de NOAA
+        # (1971-2000, producto OI.v2 más grueso) suaviza el afloramiento costero frío.
+        corr = par.corr().iloc[0, 1] if len(par) > 30 else float("nan")
+        media = (par.iloc[:, 0] - par.iloc[:, 1]).mean() if len(par) else float("nan")
         checks = {
             "rango físico": bool(g["sst"].dropna().between(5, 35).all()),
             "dato reciente": (hoy - ultimo).days <= MAX_DIAS_SIN_DATO,
-            "climatología coherente": len(dif) > 0 and abs(dif.mean()) < 1.5 and dif.std() < 0.5,
+            "anomalía coherente": bool(corr >= 0.9 and abs(media) < 3.0),
         }
         ok &= all(checks.values())
         estado = ", ".join(f"{k} {'OK' if v else 'REVISAR'}" for k, v in checks.items())
-        print(f"  {punto:10s} último dato {ultimo}: {estado}")
+        print(f"  {punto:10s} último dato {ultimo}: {estado} "
+              f"(correlación con NOAA {corr:.2f}, diferencia media {media:+.2f} °C)")
     return ok
 
 
