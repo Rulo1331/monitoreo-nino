@@ -4,8 +4,8 @@ name: Recolectar datos El Niño
 
 on:
   schedule:
-    - cron: "0 12 * * 2"   # cada martes 12:00 UTC = 07:00 hora de Perú
-                           # (NOAA publica los datos semanales los lunes)
+    - cron: "0 12 * * *"   # todos los días 12:00 UTC = 07:00 hora de Perú
+                           # (la TSM costera es diaria; los demás pasos no duplican datos)
   workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
 
 jobs:
@@ -20,6 +20,8 @@ jobs:
       BQ_TABLA_ICEN: ${{ vars.BQ_TABLA_ICEN || 'icen' }}
       BQ_TABLA_SEMANAL: ${{ vars.BQ_TABLA_SEMANAL || 'nino_semanal' }}
       BQ_TABLA_RONI: ${{ vars.BQ_TABLA_RONI || 'roni' }}
+      BQ_TABLA_TSM: ${{ vars.BQ_TABLA_TSM || 'tsm_costera' }}
+      BQ_TABLA_TSM_CLIMA: ${{ vars.BQ_TABLA_TSM_CLIMA || 'tsm_costera_clima' }}
     steps:
       - uses: actions/checkout@v4          # 1. descarga tu código
       - uses: actions/setup-python@v5      # 2. instala Python
@@ -31,4 +33,8 @@ jobs:
       - name: Regiones Niño semanal + RONI (variable 2)
         if: always()                         # corre aunque falle el paso anterior
         run: python recolectores/nino_semanal_roni.py --validar
+      - name: TSM costera diaria (variable 3)
+        if: always()
+        timeout-minutes: 90                  # la primera ejecución descarga desde 1991
+        run: python recolectores/tsm_costera.py --validar
       # Aquí iremos agregando un paso por cada nueva variable
