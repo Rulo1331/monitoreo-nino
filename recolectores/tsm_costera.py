@@ -30,7 +30,6 @@ import numpy as np
 import pandas as pd
 import requests
 
-ERDDAP = os.getenv("ERDDAP_URL", "https://coastwatch.pfeg.noaa.gov/erddap")
 DS_FINAL = "ncdcOisst21Agg_LonPM180"
 DS_NRT = "ncdcOisst21NrtAgg_LonPM180"
 INICIO_HISTORICO = date(1991, 1, 1)
@@ -54,22 +53,45 @@ PUNTOS = [
 
 
 # ---------------- Acceso a ERDDAP ----------------
-def pedir_csv(dataset, consulta, intentos=4):
-    """Descarga un CSV de ERDDAP con reintentos (el servidor a veces responde 5xx)."""
-    url = f"{ERDDAP}/griddap/{dataset}.csv?{consulta}"
-    for i in range(intentos):
-        try:
-            r = requests.get(url, timeout=600,
-                             headers={"User-Agent": "monitoreo-nino/1.0 (uso interno)"})
+# Servidores ERDDAP de NOAA que se prueban en orden (se pueden cambiar con ERDDAP_URLS,
+# separados por comas). Si uno falla o no tiene el dataset, se usa el siguiente.
+SERVIDORES = [u.strip().rstrip("/") for u in (os.getenv("ERDDAP_URLS") or os.getenv("ERDDAP_URL") or
+              "https://coastwatch.pfeg.noaa.gov/erddap,https://upwell.pfeg.noaa.gov/erddap").split(",")]
+
+
+def pedir_csv(dataset, consulta, intentos=3):
+    """Descarga un CSV de ERDDAP. Muestra el código y el mensaje de cada respuesta fallida,
+    reintenta ante errores temporales y prueba el siguiente servidor si uno no responde."""
+    from urllib.parse import quote
+    q = quote(consulta, safe="=&,")          # ERDDAP exige codificar [ ] ( ) :
+    historial = []
+    for servidor in list(SERVIDORES):
+        url = f"{servidor}/griddap/{dataset}.csv?{q}"
+        for i in range(intentos):
+            try:
+                r = requests.get(url, timeout=600,
+                                 headers={"User-Agent": "monitoreo-nino/1.0 (uso interno)"})
+            except requests.RequestException as e:
+                historial.append(f"{servidor}: {type(e).__name__}")
+                print(f"   [{servidor}] intento {i + 1}: sin respuesta ({type(e).__name__}: {e})", flush=True)
+                time.sleep(5 * (i + 1))
+                continue
             if r.status_code == 200:
-                # La segunda fila de ERDDAP contiene las unidades: se descarta
-                return pd.read_csv(io.StringIO(r.text), skiprows=[1])
-            if r.status_code in (400, 404):
-                raise ValueError(f"ERDDAP rechazó la consulta ({r.status_code}): {r.text[:300]}")
-        except requests.RequestException as e:
-            print(f"   reintento {i + 1}: {e}")
-        time.sleep(5 * (i + 1))
-    raise RuntimeError(f"ERDDAP no respondió tras {intentos} intentos: {url}")
+                if servidor != SERVIDORES[0]:            # recordar el servidor que sí funcionó
+                    SERVIDORES.remove(servidor)
+                    SERVIDORES.insert(0, servidor)
+                return pd.read_csv(io.StringIO(r.text), skiprows=[1])   # fila 2 = unidades
+            mensaje = " ".join(r.text.split())[:300]
+            historial.append(f"{servidor}: HTTP {r.status_code}")
+            print(f"   [{servidor}] intento {i + 1}: HTTP {r.status_code} -> {mensaje}", flush=True)
+            if r.status_code == 404 and "no matching results" in r.text.lower():
+                raise ValueError(f"La consulta no tiene datos en ese rango: {mensaje}")
+            if r.status_code == 400:
+                raise ValueError(f"ERDDAP rechazó la sintaxis de la consulta: {mensaje}")
+            if r.status_code in (403, 404):
+                break                                    # bloqueado o sin el dataset: siguiente servidor
+            time.sleep(5 * (i + 1))                      # 429 / 5xx: esperar y reintentar
+    raise RuntimeError("Ningún servidor ERDDAP respondió correctamente. Resumen: " + "; ".join(historial))
 
 
 def ultima_fecha(dataset):
