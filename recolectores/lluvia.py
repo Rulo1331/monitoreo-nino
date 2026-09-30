@@ -87,7 +87,7 @@ def url_api(servicio):
     return f"https://{prefijo}{servicio}.open-meteo.com"
 
 
-def pedir(servicio, ruta, params, intentos=4):
+def pedir(servicio, ruta, params, intentos=5):
     params = dict(params)
     if os.getenv("OPEN_METEO_API_KEY"):
         params["apikey"] = os.getenv("OPEN_METEO_API_KEY")
@@ -105,7 +105,11 @@ def pedir(servicio, ruta, params, intentos=4):
         mensaje = " ".join(r.text.split())[:300]
         print(f"   [{servicio}] intento {i + 1}: HTTP {r.status_code} -> {mensaje}", flush=True)
         if r.status_code == 429:
-            raise LimiteExcedido(mensaje)
+            if "minutely" in r.text.lower():            # límite por minuto: basta con esperar
+                print(f"   [{servicio}] límite por minuto: esperando 65 s...", flush=True)
+                time.sleep(65)
+                continue
+            raise LimiteExcedido(mensaje)                # límite por hora o por día: detenerse
         if r.status_code == 400:
             raise ValueError(f"Open-Meteo rechazó la consulta: {mensaje}")
         time.sleep(10 * (i + 1))
@@ -223,22 +227,37 @@ def percentiles_senamhi(valores):
     return dict(zip(["p75", "p90", "p95", "p99"], np.round(q, 2))), len(humedos)
 
 
+def serie_historica(puntos, modelo):
+    resp = pedir("archive-api", "/v1/archive", {**coords(puntos), "timezone": ZONA_HORARIA,
+                 "start_date": CLIMA_DESDE, "end_date": CLIMA_HASTA, "models": modelo,
+                 "daily": "precipitation_sum"})
+    return [r["daily"]["precipitation_sum"] for r in como_lista(resp)]
+
+
 def umbrales_zona(zona, puntos):
-    """Umbrales del modelo (ERA5-Land 1991-2020) con el método SENAMHI. Cada punto representativo
-    se trata como una 'estación' (serie puntual), igual que los umbrales oficiales."""
+    """Umbrales del modelo (1991-2020) con el método SENAMHI. Cada punto representativo se trata
+    como una 'estación' (serie puntual), igual que los umbrales oficiales.
+    ERA5-Land (0.1°) solo tiene datos sobre tierra: si un punto costero queda sin datos,
+    se usa ERA5 (0.25°) para ese punto."""
     pz = [p for p in puntos if p["zona"] == zona]
     representativos = pz if len(pz) <= 4 else [pz[i] for i in np.linspace(0, len(pz) - 1, 4).astype(int)]
-    resp = pedir("archive-api", "/v1/archive", {**coords(representativos), "timezone": ZONA_HORARIA,
-                 "start_date": CLIMA_DESDE, "end_date": CLIMA_HASTA, "models": "era5_land",
-                 "daily": "precipitation_sum"})
-    valores, total = [], 0
-    for r in como_lista(resp):
-        serie = r["daily"]["precipitation_sum"]
-        total += sum(v is not None for v in serie)
-        valores += serie
+    series = serie_historica(representativos, "era5_land")
+    sin_datos = [i for i, s_ in enumerate(series) if sum(v is not None for v in s_) < 0.8 * len(s_)]
+    fuentes = {"ERA5-Land"}
+    if sin_datos:
+        print(f"   {zona}: {len(sin_datos)} de {len(series)} puntos sin datos en ERA5-Land -> se usa ERA5", flush=True)
+        reemplazo = serie_historica([representativos[i] for i in sin_datos], "era5")
+        for i, s_ in zip(sin_datos, reemplazo):
+            series[i] = s_
+        fuentes.add("ERA5")
+    valores = [v for s_ in series for v in s_]
+    validos = sum(v is not None for v in valores)
     modelo, n_humedos = percentiles_senamhi(valores)
+    print(f"   {zona}: {validos} días válidos, {n_humedos} con lluvia >{DIA_CON_LLUVIA_MM} mm "
+          f"({100 * n_humedos / validos if validos else 0:.1f}%)", flush=True)
     fila = {"zona": zona, "puntos_usados": len(representativos), "dias_con_lluvia": n_humedos,
-            "pct_dias_con_lluvia": round(100 * n_humedos / total, 2) if total else None}
+            "pct_dias_con_lluvia": round(100 * n_humedos / validos, 2) if validos else None,
+            "_fuente_modelo": " + ".join(sorted(fuentes))}
     for k in ("p75", "p90", "p95", "p99"):
         fila[f"modelo_{k}"] = None if modelo is None else float(modelo[k])
     return fila
@@ -249,8 +268,12 @@ def completar_umbrales(tabla):
     tabla = tabla.copy()
     for k in ("p75", "p90", "p95", "p99"):
         tabla[k] = [UMBRALES_OFICIALES.get(z, {}).get(k, m) for z, m in zip(tabla["zona"], tabla[f"modelo_{k}"])]
+    fm = tabla["_fuente_modelo"] if "_fuente_modelo" in tabla else pd.Series([None] * len(tabla), index=tabla.index)
+    previa = tabla["fuente_umbral"] if "fuente_umbral" in tabla else pd.Series([None] * len(tabla), index=tabla.index)
     tabla["fuente_umbral"] = [UMBRALES_OFICIALES[z]["fuente"] if z in UMBRALES_OFICIALES
-                              else "Modelo ERA5-Land 1991-2020 (método SENAMHI)" for z in tabla["zona"]]
+                              else f"Modelo {f} 1991-2020 (método SENAMHI)" if isinstance(f, str)
+                              else p if isinstance(p, str) else "Modelo ERA5-Land 1991-2020 (método SENAMHI)"
+                              for z, f, p in zip(tabla["zona"], fm, previa)]
     return tabla
 
 
@@ -489,7 +512,9 @@ if __name__ == "__main__":
 
     print("4. Umbrales por zona (método SENAMHI)...")
     umb = None if a.reconstruir_clima else leer_tabla("BQ_TABLA_LLUVIA_UMBRALES", "lluvia_umbrales")
-    hechas = set() if umb is None else set(umb["zona"])
+    hechas = set() if umb is None else set(umb.loc[umb["modelo_p99"].notna(), "zona"])
+    if umb is not None:
+        umb = umb[umb["zona"].isin(hechas)]          # las zonas sin umbral del modelo se recalculan
     pendientes = [z["zona"] for z in ZONAS if z["zona"] not in hechas]
     nuevas = []
     for zona in pendientes[:MAX_ZONAS_CLIMA_POR_EJECUCION]:
@@ -501,14 +526,19 @@ if __name__ == "__main__":
             break
     if nuevas:
         base = umb[[c for c in umb.columns if c.startswith("modelo_") or c in
-                    ("zona", "dias_con_lluvia", "pct_dias_con_lluvia", "puntos_usados")]] if umb is not None else None
+                    ("zona", "dias_con_lluvia", "pct_dias_con_lluvia", "puntos_usados", "fuente_umbral")]] if umb is not None else None
         umb = pd.concat([c for c in (base, pd.DataFrame(nuevas)) if c is not None], ignore_index=True)
     if umb is not None:
         umb = completar_umbrales(umb)
         print("   Guardado en:", guardar(umb, "BQ_TABLA_LLUVIA_UMBRALES", "lluvia_umbrales", ESQUEMA_UMBRALES))
         for z in UMBRALES_OFICIALES:
             f = umb[umb["zona"] == z]
-            if len(f) and not pd.isna(f["modelo_p99"].iloc[0]):
+            if not len(f):
+                print(f"   Contraste {z}: pendiente (umbral del modelo aún no calculado)")
+            elif pd.isna(f["modelo_p99"].iloc[0]):
+                print(f"   Contraste {z}: el modelo no tiene suficientes días con lluvia "
+                      f"({f['dias_con_lluvia'].iloc[0]}) para calcular percentiles")
+            else:
                 r = f.iloc[0]
                 print(f"   Contraste {z}: oficial P75/P90/P95/P99 = {r.p75}/{r.p90}/{r.p95}/{r.p99} mm | "
                       f"modelo = {r.modelo_p75}/{r.modelo_p90}/{r.modelo_p95}/{r.modelo_p99} mm")
