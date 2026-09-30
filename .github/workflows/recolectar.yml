@@ -23,6 +23,11 @@ jobs:
       BQ_TABLA_RONI: ${{ vars.BQ_TABLA_RONI || 'roni' }}
       BQ_TABLA_TSM: ${{ vars.BQ_TABLA_TSM || 'tsm_costera' }}
       BQ_TABLA_TSM_CLIMA: ${{ vars.BQ_TABLA_TSM_CLIMA || 'tsm_costera_clima' }}
+      BQ_TABLA_LLUVIA: ${{ vars.BQ_TABLA_LLUVIA || 'lluvia_zonas' }}
+      BQ_TABLA_LLUVIA_PUNTOS: ${{ vars.BQ_TABLA_LLUVIA_PUNTOS || 'lluvia_puntos' }}
+      BQ_TABLA_LLUVIA_UMBRALES: ${{ vars.BQ_TABLA_LLUVIA_UMBRALES || 'lluvia_umbrales' }}
+      BQ_TABLA_EVENTOS: ${{ vars.BQ_TABLA_EVENTOS || 'eventos_historicos' }}
+      OPEN_METEO_API_KEY: ${{ secrets.OPEN_METEO_API_KEY }}   # vacío = plan gratuito (prueba)
     steps:
       - uses: actions/checkout@v5          # 1. descarga tu código
       - uses: actions/setup-python@v6      # 2. instala Python
@@ -38,4 +43,8 @@ jobs:
         if: always()
         timeout-minutes: 90                  # la primera ejecución descarga desde 1991
         run: python recolectores/tsm_costera.py --validar
+      - name: Lluvia por zonas - modelo (variable 5a)
+        if: always()
+        timeout-minutes: 30
+        run: python recolectores/lluvia.py --validar
       # Aquí iremos agregando un paso por cada nueva variable
