@@ -2,3 +2,4 @@ requests
 pandas
 numpy
 google-cloud-bigquery[pandas]
+netCDF4
