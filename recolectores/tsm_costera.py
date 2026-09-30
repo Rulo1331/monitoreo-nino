@@ -24,7 +24,7 @@ Destino: mismas variables que los otros recolectores (BQ_PROYECTO, BQ_DATASET,
 GCP_SA_KEY...). Tablas: BQ_TABLA_TSM (por defecto 'tsm_costera') y
 BQ_TABLA_TSM_CLIMA (por defecto 'tsm_costera_clima'). Sin BQ_PROYECTO usa SQLite local.
 """
-import argparse, io, json, math, os, sqlite3, sys, time
+import argparse, io, json, math, os, re, sqlite3, sys, time
 from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
@@ -250,7 +250,7 @@ def guardar(df, env, defecto, esquema_def):
 
 
 # ---------------- Proceso principal ----------------
-def actualizar(reconstruir=False):
+def actualizar_erddap(reconstruir=False):
     fin_final, fin_nrt = ultima_fecha(DS_FINAL), ultima_fecha(DS_NRT)
     print(f"Datos disponibles en NOAA: final hasta {fin_final}, preliminar hasta {fin_nrt}")
     existente = None if reconstruir else leer_tabla("BQ_TABLA_TSM", "tsm_costera")
@@ -283,6 +283,123 @@ def actualizar(reconstruir=False):
 
     datos = aplicar_anomalias(datos.drop(columns=["sst_clima", "anom_1991_2020"], errors="ignore"), clima)
     datos["fuente"] = "NOAA OISST v2.1 (CoastWatch ERDDAP)"
+    datos["actualizado_en"] = datetime.now(timezone.utc)
+    return datos, clima
+
+
+# ---------------- Actualización diaria desde NCEI (fuente original de OISST) ----------------
+# Los mismos archivos diarios que ERDDAP redistribuye, publicados por NOAA NCEI.
+# Se usan para la actualización diaria: solo se descargan los días nuevos o los que pasaron
+# de preliminar a final (normalmente 2 a 5 archivos de ~1.6 MB).
+NCEI_URL = os.getenv("NCEI_URL", "https://www.ncei.noaa.gov/data/sea-surface-temperature-optimum-interpolation/v2.1/access/avhrr")
+ARCHIVO_NCEI = re.compile(r'href="(oisst-avhrr-v02r01\.(\d{8})(_preliminary)?\.nc)"')
+DIAS_REVISION_NCEI = 30        # ventana máxima hacia atrás que se revisa en cada ejecución
+
+
+def http_get(url, intentos=3):
+    for i in range(intentos):
+        try:
+            r = requests.get(url, timeout=180, headers={"User-Agent": "monitoreo-nino/1.0 (uso interno)"})
+            if r.status_code == 200:
+                return r
+            mensaje = " ".join(r.text.split())[:300]
+            print(f"   [NCEI] intento {i + 1}: HTTP {r.status_code} -> {mensaje}", flush=True)
+            if r.status_code in (403, 404):
+                break
+        except requests.RequestException as e:
+            print(f"   [NCEI] intento {i + 1}: sin respuesta ({type(e).__name__})", flush=True)
+        time.sleep(10 * (i + 1))
+    raise RuntimeError(f"NCEI no respondió correctamente: {url}")
+
+
+def indice_mes(anio_mes):
+    """Lista de archivos disponibles en el directorio mensual: {fecha: {'final': nombre, 'preliminar': nombre}}."""
+    html = http_get(f"{NCEI_URL}/{anio_mes}/").text
+    disponibles = {}
+    for nombre, ymd, prelim in ARCHIVO_NCEI.findall(html):
+        d = datetime.strptime(ymd, "%Y%m%d").date()
+        disponibles.setdefault(d, {})["preliminar" if prelim else "final"] = nombre
+    return disponibles
+
+
+def leer_archivo_ncei(anio_mes, nombre, celdas):
+    """Descarga un archivo diario y extrae SST y anomalía en las celdas de cada punto."""
+    import netCDF4
+    contenido = http_get(f"{NCEI_URL}/{anio_mes}/{nombre}").content
+    with netCDF4.Dataset("oisst", memory=contenido) as nc:
+        lats, lons = nc.variables["lat"][:], nc.variables["lon"][:]
+        sst, anom = nc.variables["sst"], nc.variables["anom"]
+        valores = {}
+        for punto, (lat, lon) in celdas.items():
+            i = int(np.argmin(np.abs(lats - lat)))
+            j = int(np.argmin(np.abs(lons - (lon % 360))))      # NCEI usa longitudes 0-360
+            if abs(lats[i] - lat) > 0.01 or abs(lons[j] - (lon % 360)) > 0.01:
+                raise ValueError(f"La grilla de NCEI no coincide con la celda de {punto}")
+            v_sst, v_anom = sst[0, 0, i, j], anom[0, 0, i, j]
+            valores[punto] = (None if np.ma.is_masked(v_sst) else round(float(v_sst), 2),
+                              None if np.ma.is_masked(v_anom) else round(float(v_anom), 2))
+    return valores
+
+
+def actualizar_ncei(existente):
+    info = existente.drop_duplicates("punto").set_index("punto")
+    celdas = {p: (float(info.loc[p, "lat_celda"]), float(info.loc[p, "lon_celda"])) for p in info.index}
+    ayer = datetime.now(timezone.utc).date() - timedelta(days=1)
+    finales = existente[existente["version"] == "final"].groupby("punto")["fecha"].max()
+    desde = max(finales.min() + timedelta(days=1), ayer - timedelta(days=DIAS_REVISION_NCEI))
+    guardadas = existente[existente["fecha"] >= desde].groupby("fecha")["version"].agg(
+        lambda v: "final" if (v == "final").all() else "preliminar").to_dict()
+
+    meses = sorted({(desde + timedelta(days=k)).strftime("%Y%m") for k in range((ayer - desde).days + 1)})
+    disponibles = {}
+    for m in meses:
+        disponibles.update(indice_mes(m))
+
+    filas, n_final, n_prelim = [], 0, 0
+    for k in range((ayer - desde).days + 1):
+        d = desde + timedelta(days=k)
+        opciones, actual = disponibles.get(d, {}), guardadas.get(d)
+        if actual == "final":
+            continue
+        if "final" in opciones:
+            version, nombre = "final", opciones["final"]; n_final += 1
+        elif "preliminar" in opciones and actual is None:
+            version, nombre = "preliminar", opciones["preliminar"]; n_prelim += 1
+        else:
+            continue       # sin archivo nuevo para ese día
+        for punto, (v_sst, v_anom) in leer_archivo_ncei(d.strftime("%Y%m"), nombre, celdas).items():
+            filas.append({"punto": punto, "region": info.loc[punto, "region"], "fecha": d,
+                          "lat_celda": celdas[punto][0], "lon_celda": celdas[punto][1],
+                          "distancia_km": info.loc[punto, "distancia_km"], "sst": v_sst,
+                          "anom_noaa_1971_2000": v_anom, "version": version})
+        time.sleep(0.5)    # cortesía con el servidor
+    print(f"NCEI: {n_final} archivos finales y {n_prelim} preliminares descargados "
+          f"(revisado desde {desde} hasta {ayer})")
+    if not filas:
+        return existente
+    nuevos = pd.DataFrame(filas)
+    clave = set(zip(nuevos["punto"], nuevos["fecha"]))
+    conservar = existente[[(p, f) not in clave for p, f in zip(existente["punto"], existente["fecha"])]]
+    return pd.concat([conservar, nuevos], ignore_index=True)
+
+
+def actualizar(reconstruir=False):
+    """Si ya existe el histórico, actualiza desde NCEI (liviano). Si no existe o se pide
+    reconstruir, descarga el histórico completo desde ERDDAP."""
+    existente = None if reconstruir else leer_tabla("BQ_TABLA_TSM", "tsm_costera")
+    if existente is None or set(existente["punto"]) != {p["punto"] for p in PUNTOS}:
+        print("No hay histórico completo guardado: se descarga desde ERDDAP.")
+        return actualizar_erddap(reconstruir)
+    datos = actualizar_ncei(existente)
+    datos = datos.sort_values(["punto", "fecha", "version"]).drop_duplicates(["punto", "fecha"], keep="first")
+    clima = leer_tabla("BQ_TABLA_TSM_CLIMA", "tsm_costera_clima")
+    if clima is None:
+        clima = climatologia(datos)
+        print("Guardado en:", guardar(clima, "BQ_TABLA_TSM_CLIMA", "tsm_costera_clima", ESQUEMA_CLIMA))
+    datos = aplicar_anomalias(datos.drop(columns=["sst_clima", "anom_1991_2020"], errors="ignore"), clima)
+    datos["fuente"] = datos["fuente"].fillna("NOAA OISST v2.1 (NCEI)") if "fuente" in datos else "NOAA OISST v2.1 (NCEI)"
+    nuevos = datos["actualizado_en"].isna() if "actualizado_en" in datos else pd.Series(True, index=datos.index)
+    datos.loc[nuevos, "fuente"] = "NOAA OISST v2.1 (NCEI)"
     datos["actualizado_en"] = datetime.now(timezone.utc)
     return datos, clima
 
