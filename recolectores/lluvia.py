@@ -65,8 +65,11 @@ ZONAS = [
 UMBRALES_CHAO = {"p75": 0.82, "p90": 1.96, "p95": 3.04, "p99": 6.02}
 UMBRALES_OFICIALES = {
     "Valle Chao": {**UMBRALES_CHAO, "fuente": "SENAMHI 2014 (NT 001) vía CENEPRED 2017 - distrito Chao"},
-    # Virú no tiene umbral oficial en el informe: se usan los de Chao (valle vecino, mismo clima desértico).
+    # Virú y Trujillo no tienen umbral oficial disponible: se usan los de Chao (costa desértica similar).
+    # El contraste con ERA5 (sep-2026) mostró que el modelo sobrestima mucho la lluvia costera
+    # (36-42% de días con lluvia y umbrales 2.5 a 3 veces mayores), por eso no se usa en la costa.
     "Valle Virú": {**UMBRALES_CHAO, "fuente": "Aproximación: umbrales oficiales de Chao aplicados a Virú"},
+    "Trujillo": {**UMBRALES_CHAO, "fuente": "Aproximación: umbrales oficiales de Chao aplicados a Trujillo"},
 }
 DIA_CON_LLUVIA_MM = 0.1                 # criterio SENAMHI
 UMBRAL_AREA_MM = {"local": 1.0, "referencial": 1.0, "cuenca alta": 10.0}   # para % del área con lluvia
