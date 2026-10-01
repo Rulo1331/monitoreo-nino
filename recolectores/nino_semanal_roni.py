@@ -125,13 +125,17 @@ def validar(sem, roni):
     print(f"  Semanal: {len(sem)} semanas, rango físico de anomalías {'OK' if rango_ok else 'REVISAR'}")
     ok &= bool(rango_ok)
     if sem["anom_tropical"].notna().any():
-        rec = sem.dropna(subset=["anom_tropical"]).tail(52)
+        # NOAA ajusta la varianza de los índices relativos, así que la diferencia tradicional-relativa
+        # NO es idéntica en las 4 regiones (en la práctica varía ~0.2 °C). Lo que sí debe cumplirse,
+        # si las columnas están bien alineadas, es que cada región relativa siga a su versión tradicional.
+        rec = sem.dropna(subset=["anom_tropical"]).tail(104)
+        correl = min(rec[f"anom_{r}"].corr(rec[f"rel_anom_{r}"]) for r in REGIONES)
         dif = pd.concat([rec[f"anom_{r}"] - rec[f"rel_anom_{r}"] for r in REGIONES], axis=1)
         dispersion = float(dif.std(axis=1).max())
-        rel_ok = dispersion <= 0.15
-        print(f"  Relativa: diferencia con la tradicional igual en las 4 regiones "
-              f"(dispersión máx. {dispersion:.2f} °C) {'OK' if rel_ok else 'REVISAR'}")
-        ok &= rel_ok
+        rel_ok = correl >= 0.9 and dispersion <= 0.4
+        print(f"  Relativa: alineada con la tradicional (correlación mín. {correl:.2f}, "
+              f"dispersión entre regiones {dispersion:.2f} °C) {'OK' if rel_ok else 'REVISAR'}")
+        ok &= bool(rel_ok)
     pasos = sem["semana"].diff().dropna().apply(lambda d: d.days)
     pasos_ok = bool((pasos == 7).all())
     print(f"  Semanal: semanas consecutivas cada 7 días {'OK' if pasos_ok else 'REVISAR'}")
