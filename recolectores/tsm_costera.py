@@ -341,6 +341,19 @@ def leer_archivo_ncei(anio_mes, nombre, celdas):
     return valores
 
 
+MAX_RELLENO_POR_EJECUCION = int(os.getenv("TSM_MAX_RELLENO", "300"))  # días de hueco que se rellenan por ejecución
+
+
+def describir_tramos(fechas):
+    """Resume una lista de fechas como tramos continuos: '2021-05-01 a 2024-08-09 (1196 días)'."""
+    fechas = sorted(fechas); tramos, ini, prev = [], fechas[0], fechas[0]
+    for d in fechas[1:] + [None]:
+        if d is None or (d - prev).days > 1:
+            tramos.append(f"{ini} a {prev} ({(prev - ini).days + 1} días)"); ini = d
+        prev = d if d is not None else prev
+    return "; ".join(tramos[:5]) + (" ..." if len(tramos) > 5 else "")
+
+
 def actualizar_ncei(existente):
     info = existente.drop_duplicates("punto").set_index("punto")
     celdas = {p: (float(info.loc[p, "lat_celda"]), float(info.loc[p, "lon_celda"])) for p in info.index}
@@ -350,14 +363,26 @@ def actualizar_ncei(existente):
     guardadas = existente[existente["fecha"] >= desde].groupby("fecha")["version"].agg(
         lambda v: "final" if (v == "final").all() else "preliminar").to_dict()
 
-    meses = sorted({(desde + timedelta(days=k)).strftime("%Y%m") for k in range((ayer - desde).days + 1)})
+    # Huecos del histórico (días que faltan antes de la ventana reciente): se rellenan por tandas
+    presentes = set(existente.groupby("fecha")["punto"].nunique().loc[lambda n: n == len(celdas)].index)
+    inicio = existente["fecha"].min()
+    huecos = [inicio + timedelta(days=k) for k in range((desde - inicio).days)
+              if inicio + timedelta(days=k) not in presentes]
+    relleno = huecos[:MAX_RELLENO_POR_EJECUCION]
+    if huecos:
+        print(f"Histórico: faltan {len(huecos)} días ({describir_tramos(huecos)}). "
+              f"En esta ejecución se rellenan {len(relleno)}.")
+
+    fechas_revisar = relleno + [desde + timedelta(days=k) for k in range((ayer - desde).days + 1)]
+    meses = sorted({d.strftime("%Y%m") for d in fechas_revisar})
     disponibles = {}
     for m in meses:
         disponibles.update(indice_mes(m))
+    for d in relleno:                      # los huecos se tratan como días aún no guardados
+        guardadas.pop(d, None)
 
     filas, n_final, n_prelim = [], 0, 0
-    for k in range((ayer - desde).days + 1):
-        d = desde + timedelta(days=k)
+    for d in fechas_revisar:
         opciones, actual = disponibles.get(d, {}), guardadas.get(d)
         if actual == "final":
             continue
@@ -374,7 +399,7 @@ def actualizar_ncei(existente):
                           "anom_noaa_1971_2000": v_anom, "version": version})
         time.sleep(0.5)    # cortesía con el servidor
     print(f"NCEI: {n_final} archivos finales y {n_prelim} preliminares descargados "
-          f"(revisado desde {desde} hasta {ayer})")
+          f"(revisado desde {desde} hasta {ayer}{', más huecos del histórico' if relleno else ''})")
     if not filas:
         return existente
     nuevos = pd.DataFrame(filas)
@@ -392,8 +417,18 @@ def actualizar(reconstruir=False):
         return actualizar_erddap(reconstruir)
     datos = actualizar_ncei(existente)
     datos = datos.sort_values(["punto", "fecha", "version"]).drop_duplicates(["punto", "fecha"], keep="first")
+    # Protección: una actualización nunca debe tener MENOS días que lo ya guardado
+    antes_n = existente.groupby("punto")["fecha"].nunique()
+    despues_n = datos.groupby("punto")["fecha"].nunique()
+    perdidos = (antes_n - despues_n.reindex(antes_n.index).fillna(0)).clip(lower=0)
+    if perdidos.sum() > 0:
+        raise RuntimeError(f"Se perderían días al guardar ({perdidos.to_dict()}). No se guarda nada; revisar.")
+    antes = set(existente.loc[(existente["fecha"] >= CLIMA_DESDE) & (existente["fecha"] <= CLIMA_HASTA), "fecha"])
+    ahora = set(datos.loc[(datos["fecha"] >= CLIMA_DESDE) & (datos["fecha"] <= CLIMA_HASTA), "fecha"])
     clima = leer_tabla("BQ_TABLA_TSM_CLIMA", "tsm_costera_clima")
-    if clima is None:
+    if clima is None or ahora != antes:
+        if clima is not None:
+            print("Se completaron días del periodo 1991-2020: se recalcula la climatología.")
         clima = climatologia(datos)
         print("Guardado en:", guardar(clima, "BQ_TABLA_TSM_CLIMA", "tsm_costera_clima", ESQUEMA_CLIMA))
     datos = aplicar_anomalias(datos.drop(columns=["sst_clima", "anom_1991_2020"], errors="ignore"), clima)
@@ -417,6 +452,8 @@ def validar(datos):
         # (1971-2000, producto OI.v2 más grueso) suaviza el afloramiento costero frío.
         corr = par.corr().iloc[0, 1] if len(par) > 30 else float("nan")
         media = (par.iloc[:, 0] - par.iloc[:, 1]).mean() if len(par) else float("nan")
+        esperados = (ultimo - g["fecha"].min()).days + 1
+        faltan = esperados - g["fecha"].nunique()
         checks = {
             "rango físico": bool(g["sst"].dropna().between(5, 35).all()),
             "dato reciente": (hoy - ultimo).days <= MAX_DIAS_SIN_DATO,
@@ -424,6 +461,7 @@ def validar(datos):
         }
         ok &= all(checks.values())
         estado = ", ".join(f"{k} {'OK' if v else 'REVISAR'}" for k, v in checks.items())
+        estado += f", histórico {'completo' if faltan == 0 else f'con {faltan} días por rellenar'}"
         print(f"  {punto:10s} último dato {ultimo}: {estado} "
               f"(correlación con NOAA {corr:.2f}, diferencia media {media:+.2f} °C)")
     return ok
