@@ -27,6 +27,11 @@ jobs:
       BQ_TABLA_LLUVIA_PUNTOS: ${{ vars.BQ_TABLA_LLUVIA_PUNTOS || 'lluvia_puntos' }}
       BQ_TABLA_LLUVIA_UMBRALES: ${{ vars.BQ_TABLA_LLUVIA_UMBRALES || 'lluvia_umbrales' }}
       BQ_TABLA_EVENTOS: ${{ vars.BQ_TABLA_EVENTOS || 'eventos_historicos' }}
+      BQ_TABLA_LLUVIA_SAT: ${{ vars.BQ_TABLA_LLUVIA_SAT || 'lluvia_satelite' }}
+      BQ_TABLA_LLUVIA_CONTRASTE: ${{ vars.BQ_TABLA_LLUVIA_CONTRASTE || 'lluvia_contraste' }}
+      BQ_TABLA_EVENTOS_SAT: ${{ vars.BQ_TABLA_EVENTOS_SAT || 'eventos_satelite' }}
+      EARTHDATA_USER: ${{ secrets.EARTHDATA_USER }}
+      EARTHDATA_PASS: ${{ secrets.EARTHDATA_PASS }}
       OPEN_METEO_API_KEY: ${{ secrets.OPEN_METEO_API_KEY }}   # vacío = plan gratuito (prueba)
     steps:
       - uses: actions/checkout@v5          # 1. descarga tu código
@@ -47,4 +52,8 @@ jobs:
         if: always()
         timeout-minutes: 30
         run: python recolectores/lluvia.py --validar
+      - name: Lluvia por satélite NASA IMERG (variable 5b)
+        if: always()
+        timeout-minutes: 60                  # la primera vez también procesa los eventos históricos
+        run: python recolectores/lluvia_satelite.py --validar
       # Aquí iremos agregando un paso por cada nueva variable
