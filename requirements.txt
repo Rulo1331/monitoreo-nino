@@ -3,3 +3,7 @@ pandas
 numpy
 google-cloud-bigquery[pandas]
 netCDF4
+earthaccess
+xarray
+h5netcdf
+h5py
