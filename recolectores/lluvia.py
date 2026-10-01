@@ -466,7 +466,10 @@ def guardar(df, env, defecto, esquema_def):
         print(f"\nERROR: no existe el dataset '{ds_ref}'.")
         sys.exit(1)
     try:
-        if {c.name for c in cliente.get_table(ref).schema} != {n for n, _ in esquema_def}:
+        actuales, nuevas = {c.name for c in cliente.get_table(ref).schema}, {n for n, _ in esquema_def}
+        if actuales < nuevas:
+            print(f"   Tabla '{tabla}': se agregan las columnas {sorted(nuevas - actuales)}")
+        elif actuales != nuevas:
             print(f"\nERROR: la tabla '{ref}' ya existe con otra estructura y NO se sobrescribirá.")
             sys.exit(1)
     except NotFound:
