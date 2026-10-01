@@ -33,6 +33,10 @@ DIAS_INICIALES = 60                          # primera ejecución: últimos 60 d
 DIAS_REPASO = 3                              # cada ejecución vuelve a revisar los últimos días
 VENTANA_EVENTO = 7                           # días evaluados antes de cada emergencia (incluido el día)
 CUENCA_DE_VALLE = {"Valle Virú": "Cuenca alta Virú", "Valle Chao": "Cuenca alta Chao"}
+# Referencia PROVISIONAL de lluvia significativa en la sierra, obtenida de los eventos INDECI:
+# los desbordes del río Virú (mar-2017) tuvieron 34-47 mm acumulados en 7 días en la cuenca alta
+# (IMERG); los eventos de lluvia local, 8-21 mm. Se revisará con cada temporada.
+REF_ACUM_7D_CUENCA = 30.0
 NIVEL = {None: -1, "Sin lluvia": 0, "Normal": 1, "Moderadamente lluvioso": 2, "Lluvioso": 3,
          "Muy lluvioso": 4, "Extremadamente lluvioso": 5}
 MAX_DIAS_SIN_DATO = 4
@@ -189,10 +193,13 @@ def ventana(diarios, zona, fecha, dias):
                    (diarios["fecha"] > fecha - timedelta(days=dias))]
 
 
-def indicio_origen(cat_valle, cat_cuenca):
-    """Pista (no diagnóstico) del origen del daño según dónde llovió fuerte (≥ 'Muy lluvioso').
-    Las categorías de la cuenca alta usan umbrales provisionales del modelo."""
-    valle, cuenca = NIVEL.get(cat_valle, -1) >= 4, NIVEL.get(cat_cuenca, -1) >= 4
+def indicio_origen(cat_valle, cat_cuenca, acum_7d_cuenca=None):
+    """Pista (no diagnóstico) del origen del daño. Valle: lluvia diaria ≥ 'Muy lluvioso' (umbral oficial).
+    Sierra: categoría diaria ≥ 'Muy lluvioso' (umbral provisional del modelo) o acumulado de 7 días
+    ≥ REF_ACUM_7D_CUENCA, porque lo que satura la cuenca es la lluvia de varios días."""
+    valle = NIVEL.get(cat_valle, -1) >= 4
+    cuenca = NIVEL.get(cat_cuenca, -1) >= 4 or (acum_7d_cuenca is not None and not pd.isna(acum_7d_cuenca)
+                                                and acum_7d_cuenca >= REF_ACUM_7D_CUENCA)
     if valle and cuenca:
         return "Lluvia fuerte en valle y sierra"
     if valle:
@@ -200,6 +207,14 @@ def indicio_origen(cat_valle, cat_cuenca):
     if cuenca:
         return "Lluvia en la sierra (posible crecida o huaico)"
     return "No concluyente"
+
+
+def recalcular_indicios(ev):
+    """Aplica la regla vigente a los eventos ya guardados (sin volver a descargar datos)."""
+    ev = ev.copy()
+    ev["indicio_origen"] = [indicio_origen(a, b, c) for a, b, c in
+                            zip(ev["categoria_max"], ev["categoria_cuenca"], ev["acum_7d_cuenca"])]
+    return ev
 
 
 def eventos_satelite(zonas_celdas, umbrales):
@@ -240,7 +255,7 @@ def eventos_satelite(zonas_celdas, umbrales):
                          "categoria_cuenca": categoria(cmx, umbrales.get(cuenca))})
         else:
             fila.update({"max_dia_cuenca": None, "acum_3d_cuenca": None, "acum_7d_cuenca": None, "categoria_cuenca": None})
-        fila["indicio_origen"] = indicio_origen(fila["categoria_max"], fila["categoria_cuenca"])
+        fila["indicio_origen"] = indicio_origen(fila["categoria_max"], fila["categoria_cuenca"], fila["acum_7d_cuenca"])
         filas.append(fila)
     return pd.DataFrame(filas)
 
@@ -340,7 +355,14 @@ if __name__ == "__main__":
                           else "      sin dato     ")
                 print(f"   {r.fecha} {r.zona:11s} {r.lluvia_max_dia:6.1f} mm  {cuenca}  {r.indicio_origen}")
     else:
-        print("3. Eventos INDECI: ya calculados (usa --reconstruir-eventos para repetir).")
+        nuevo_ev = recalcular_indicios(ev_sat)
+        if not nuevo_ev["indicio_origen"].equals(ev_sat["indicio_origen"]):
+            print("3. Eventos INDECI: se actualizan los indicios con la regla vigente (sin descargar datos).")
+            print("   Guardado en:", guardar(nuevo_ev, "BQ_TABLA_EVENTOS_SAT", "eventos_satelite", ESQUEMA_EVENTOS_SAT))
+            for _, r in nuevo_ev.sort_values("fecha").iterrows():
+                print(f"   {r.fecha} {r.zona:11s} cuenca 7 d {r.acum_7d_cuenca:5.1f} mm -> {r.indicio_origen}")
+        else:
+            print("3. Eventos INDECI: ya calculados (usa --reconstruir-eventos para repetir).")
 
     if a.validar and not validar(sat, zonas_celdas):
         sys.exit(1)
