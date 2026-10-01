@@ -24,6 +24,9 @@ import pandas as pd
 import requests
 
 URL_SEMANAL = "https://www.cpc.ncep.noaa.gov/data/indices/wksst9120.for"
+# Anomalías RELATIVAS: a cada región se le resta la anomalía media del trópico (20°N-20°S),
+# igual que el RONI. Es la versión que NOAA usa ahora en sus reportes semanales.
+URL_SEMANAL_REL = "https://www.cpc.ncep.noaa.gov/data/indices/rel_wksst9120.txt"
 URL_RONI = "https://www.cpc.ncep.noaa.gov/data/indices/RONI.ascii.txt"
 REGIONES = ["nino12", "nino3", "nino34", "nino4"]
 TEMPORADAS = ["DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "OND", "NDJ"]
@@ -121,6 +124,14 @@ def validar(sem, roni):
     rango_ok = anomalias.abs().max().max() < 8
     print(f"  Semanal: {len(sem)} semanas, rango físico de anomalías {'OK' if rango_ok else 'REVISAR'}")
     ok &= bool(rango_ok)
+    if sem["anom_tropical"].notna().any():
+        rec = sem.dropna(subset=["anom_tropical"]).tail(52)
+        dif = pd.concat([rec[f"anom_{r}"] - rec[f"rel_anom_{r}"] for r in REGIONES], axis=1)
+        dispersion = float(dif.std(axis=1).max())
+        rel_ok = dispersion <= 0.15
+        print(f"  Relativa: diferencia con la tradicional igual en las 4 regiones "
+              f"(dispersión máx. {dispersion:.2f} °C) {'OK' if rel_ok else 'REVISAR'}")
+        ok &= rel_ok
     pasos = sem["semana"].diff().dropna().apply(lambda d: d.days)
     pasos_ok = bool((pasos == 7).all())
     print(f"  Semanal: semanas consecutivas cada 7 días {'OK' if pasos_ok else 'REVISAR'}")
@@ -178,7 +189,10 @@ def guardar(df, tabla_env, tabla_defecto, esquema_def):
     tabla = f"{ds_ref}.{nombre}"
     try:  # protección: no sobrescribir una tabla ajena con otra estructura
         actuales = {c.name for c in cliente.get_table(tabla).schema}
-        if actuales != {n for n, _ in esquema_def}:
+        nuevas = {n for n, _ in esquema_def}
+        if actuales < nuevas:
+            print(f"   Tabla '{nombre}': se agregan las columnas {sorted(nuevas - actuales)}")
+        elif actuales != nuevas:
             print(f"\nERROR: la tabla '{tabla}' ya existe con otra estructura y NO se sobrescribirá.")
             sys.exit(1)
     except NotFound:
@@ -191,7 +205,8 @@ def guardar(df, tabla_env, tabla_defecto, esquema_def):
 
 ESQUEMA_SEMANAL = [("semana", "DATE")] + [
     (f"{p}_{r}", "FLOAT64") for r in REGIONES for p in ("sst", "anom")
-] + [("fuente", "STRING"), ("actualizado_en", "TIMESTAMP")]
+] + [(f"rel_anom_{r}", "FLOAT64") for r in REGIONES] + [
+    ("anom_tropical", "FLOAT64"), ("fuente", "STRING"), ("actualizado_en", "TIMESTAMP")]
 ESQUEMA_RONI = [("anio", "INT64"), ("mes_central", "INT64"), ("temporada", "STRING"),
                 ("roni", "FLOAT64"), ("fase", "STRING"), ("intensidad", "STRING"),
                 ("provisional", "BOOL"), ("fuente", "STRING"), ("actualizado_en", "TIMESTAMP")]
@@ -200,6 +215,7 @@ ESQUEMA_RONI = [("anio", "INT64"), ("mes_central", "INT64"), ("temporada", "STRI
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--archivo-semanal")
+    ap.add_argument("--archivo-semanal-rel")
     ap.add_argument("--archivo-roni")
     ap.add_argument("--validar", action="store_true")
     ap.add_argument("--sin-guardar", action="store_true")
@@ -207,12 +223,26 @@ if __name__ == "__main__":
 
     leer = lambda ruta, url: open(ruta, encoding="utf-8").read() if ruta else descargar(url)
     semanal = parsear_semanal(leer(a.archivo_semanal, URL_SEMANAL))
+    try:
+        rel = parsear_semanal(leer(a.archivo_semanal_rel, URL_SEMANAL_REL))
+        rel = rel[["semana"] + [f"anom_{r}" for r in REGIONES]].rename(
+            columns={f"anom_{r}": f"rel_anom_{r}" for r in REGIONES})
+        semanal = semanal.merge(rel, on="semana", how="left")
+        # tradicional - relativa = calentamiento medio del trópico (igual para todas las regiones)
+        dif = pd.concat([semanal[f"anom_{r}"] - semanal[f"rel_anom_{r}"] for r in REGIONES], axis=1)
+        semanal["anom_tropical"] = dif.mean(axis=1).round(2)
+    except Exception as e:     # la versión relativa es complementaria: si falla, se sigue sin ella
+        print(f"AVISO: no se pudo obtener la anomalía relativa ({type(e).__name__}: {e})")
+        for r in REGIONES:
+            semanal[f"rel_anom_{r}"] = None
+        semanal["anom_tropical"] = None
     roni = parsear_roni(leer(a.archivo_roni, URL_RONI))
     # Columnas en el orden del esquema
     semanal = semanal[[n for n, _ in ESQUEMA_SEMANAL]]
 
-    print("Últimas semanas (anomalías °C):")
-    print(semanal[["semana"] + [f"anom_{r}" for r in REGIONES]].tail(4).to_string(index=False))
+    print("Últimas semanas (anomalías °C; tradicional | relativa):")
+    vista = semanal[["semana", "anom_nino12", "rel_anom_nino12", "anom_nino34", "rel_anom_nino34", "anom_tropical"]]
+    print(vista.tail(4).to_string(index=False))
     print("\nÚltimas temporadas del RONI:")
     print(roni[["anio", "temporada", "roni", "fase", "intensidad", "provisional"]]
           .tail(4).to_string(index=False))
