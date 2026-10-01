@@ -31,7 +31,10 @@ PRODUCTO_HISTORICO = ("GPM_3IMERGDF", "07", "IMERG Final V07")
 FIN_FINAL_V07 = date(2025, 9, 30)            # la serie Final V07 terminó en esta fecha
 DIAS_INICIALES = 60                          # primera ejecución: últimos 60 días
 DIAS_REPASO = 3                              # cada ejecución vuelve a revisar los últimos días
-VENTANA_EVENTO = 4                           # días evaluados antes de cada emergencia (incluido el día)
+VENTANA_EVENTO = 7                           # días evaluados antes de cada emergencia (incluido el día)
+CUENCA_DE_VALLE = {"Valle Virú": "Cuenca alta Virú", "Valle Chao": "Cuenca alta Chao"}
+NIVEL = {None: -1, "Sin lluvia": 0, "Normal": 1, "Moderadamente lluvioso": 2, "Lluvioso": 3,
+         "Muy lluvioso": 4, "Extremadamente lluvioso": 5}
 MAX_DIAS_SIN_DATO = 4
 CAJA = (-79.4, -10.4, -77.0, -7.7)           # lon_min, lat_min, lon_max, lat_max (todas las zonas)
 
@@ -151,6 +154,20 @@ def descargar_dias(producto, desde, hasta, zonas_celdas, umbrales):
     return pd.DataFrame(filas)
 
 
+def acumulados(sat):
+    """Lluvia acumulada de 3 y 7 días por zona (media de la zona). Solo suma días consecutivos con dato:
+    si falta algún día de la ventana, el acumulado queda vacío para no subestimarlo."""
+    salida = []
+    for zona, g in sat.groupby("zona"):
+        g = g.sort_values("fecha").copy()
+        serie = g.set_index(pd.to_datetime(g["fecha"]))["lluvia_media"].asfreq("D")
+        for n in (3, 7):
+            acum = serie.rolling(n, min_periods=n).sum().round(2)
+            g[f"acum_{n}d"] = acum.reindex(pd.to_datetime(g["fecha"])).values
+        salida.append(g)
+    return pd.concat(salida, ignore_index=True)
+
+
 # ------------------------------------------------------------------ Contraste pronóstico vs satélite
 def contraste(sat):
     pron = leer_tabla("BQ_TABLA_LLUVIA", "lluvia_zonas")
@@ -167,6 +184,24 @@ def contraste(sat):
 
 
 # ------------------------------------------------------------------ Eventos históricos INDECI
+def ventana(diarios, zona, fecha, dias):
+    return diarios[(diarios["zona"] == zona) & (diarios["fecha"] <= fecha) &
+                   (diarios["fecha"] > fecha - timedelta(days=dias))]
+
+
+def indicio_origen(cat_valle, cat_cuenca):
+    """Pista (no diagnóstico) del origen del daño según dónde llovió fuerte (≥ 'Muy lluvioso').
+    Las categorías de la cuenca alta usan umbrales provisionales del modelo."""
+    valle, cuenca = NIVEL.get(cat_valle, -1) >= 4, NIVEL.get(cat_cuenca, -1) >= 4
+    if valle and cuenca:
+        return "Lluvia fuerte en valle y sierra"
+    if valle:
+        return "Lluvia local (valle)"
+    if cuenca:
+        return "Lluvia en la sierra (posible crecida o huaico)"
+    return "No concluyente"
+
+
 def eventos_satelite(zonas_celdas, umbrales):
     ev = leer_tabla("BQ_TABLA_EVENTOS", "eventos_historicos")
     if ev is None:
@@ -174,7 +209,6 @@ def eventos_satelite(zonas_celdas, umbrales):
         return None
     ev = ev[(ev["usar_para_lluvia"].astype(bool)) & (ev["zona"].isin(zonas_celdas.keys())) &
             (ev["fecha"] <= FIN_FINAL_V07)]
-    # agrupar ventanas para minimizar búsquedas
     dias = sorted({f - timedelta(days=k) for f in ev["fecha"] for k in range(VENTANA_EVENTO)})
     tramos, ini, prev = [], dias[0], dias[0]
     for d in dias[1:] + [None]:
@@ -185,17 +219,29 @@ def eventos_satelite(zonas_celdas, umbrales):
                         ignore_index=True)
     filas = []
     for _, e in ev.iterrows():
-        v = diarios[(diarios["zona"] == e["zona"]) & (diarios["fecha"] <= e["fecha"]) &
-                    (diarios["fecha"] > e["fecha"] - timedelta(days=VENTANA_EVENTO))]
-        u = umbrales.get(e["zona"])
-        mx = v["lluvia_max"].max() if len(v) else None
-        filas.append({"n": int(e["n"]), "fecha": e["fecha"], "zona": e["zona"], "localidades": e["localidades"],
-                      "confianza_zona": e["confianza_zona"], "dias_con_datos": int(len(v)),
-                      "lluvia_media_max_dia": None if v.empty else round(float(v["lluvia_media"].max()), 2),
-                      "lluvia_max_dia": None if mx is None or pd.isna(mx) else round(float(mx), 2),
-                      "acumulado_media": None if v.empty else round(float(v["lluvia_media"].sum()), 2),
-                      "categoria_max": categoria(mx, u), "nivel_aviso_max": nivel_aviso(mx, u),
-                      "fuente": PRODUCTO_HISTORICO[2]})
+        zona, cuenca = e["zona"], CUENCA_DE_VALLE.get(e["zona"])
+        v7, v3 = ventana(diarios, zona, e["fecha"], 7), ventana(diarios, zona, e["fecha"], 3)
+        u = umbrales.get(zona)
+        mx = v7["lluvia_max"].max() if len(v7) else None
+        fila = {"n": int(e["n"]), "fecha": e["fecha"], "zona": zona, "localidades": e["localidades"],
+                "confianza_zona": e["confianza_zona"], "dias_con_datos": int(len(v7)),
+                "lluvia_media_max_dia": None if v7.empty else round(float(v7["lluvia_media"].max()), 2),
+                "lluvia_max_dia": None if mx is None or pd.isna(mx) else round(float(mx), 2),
+                "acumulado_media": None if v3.empty else round(float(v3["lluvia_media"].sum()), 2),
+                "acum_7d_valle": None if v7.empty else round(float(v7["lluvia_media"].sum()), 2),
+                "categoria_max": categoria(mx, u), "nivel_aviso_max": nivel_aviso(mx, u),
+                "cuenca_alta": cuenca, "fuente": PRODUCTO_HISTORICO[2]}
+        if cuenca:
+            c7, c3 = ventana(diarios, cuenca, e["fecha"], 7), ventana(diarios, cuenca, e["fecha"], 3)
+            cmx = c7["lluvia_media"].max() if len(c7) else None      # media de la cuenca: lluvia generalizada
+            fila.update({"max_dia_cuenca": None if cmx is None or pd.isna(cmx) else round(float(cmx), 2),
+                         "acum_3d_cuenca": None if c3.empty else round(float(c3["lluvia_media"].sum()), 2),
+                         "acum_7d_cuenca": None if c7.empty else round(float(c7["lluvia_media"].sum()), 2),
+                         "categoria_cuenca": categoria(cmx, umbrales.get(cuenca))})
+        else:
+            fila.update({"max_dia_cuenca": None, "acum_3d_cuenca": None, "acum_7d_cuenca": None, "categoria_cuenca": None})
+        fila["indicio_origen"] = indicio_origen(fila["categoria_max"], fila["categoria_cuenca"])
+        filas.append(fila)
     return pd.DataFrame(filas)
 
 
@@ -203,7 +249,8 @@ def eventos_satelite(zonas_celdas, umbrales):
 ESQUEMA_SAT = [("zona", "STRING"), ("fecha", "DATE"), ("producto", "STRING"), ("celdas", "INT64"),
                ("lluvia_media", "FLOAT64"), ("lluvia_max", "FLOAT64"), ("umbral_mm", "FLOAT64"),
                ("pct_area_sobre_umbral", "FLOAT64"), ("categoria_media", "STRING"), ("categoria_max", "STRING"),
-               ("nivel_aviso_max", "STRING"), ("actualizado_en", "TIMESTAMP")]
+               ("nivel_aviso_max", "STRING"), ("actualizado_en", "TIMESTAMP"),
+               ("acum_3d", "FLOAT64"), ("acum_7d", "FLOAT64")]
 ESQUEMA_CONTRASTE = [("zona", "STRING"), ("fecha", "DATE"), ("emitido", "DATE"), ("dias_adelante", "INT64"),
                      ("lluvia_media_pronostico", "FLOAT64"), ("lluvia_max_pronostico", "FLOAT64"),
                      ("lluvia_media_satelite", "FLOAT64"), ("lluvia_max_satelite", "FLOAT64"),
@@ -212,7 +259,9 @@ ESQUEMA_EVENTOS_SAT = [("n", "INT64"), ("fecha", "DATE"), ("zona", "STRING"), ("
                        ("confianza_zona", "STRING"), ("dias_con_datos", "INT64"),
                        ("lluvia_media_max_dia", "FLOAT64"), ("lluvia_max_dia", "FLOAT64"),
                        ("acumulado_media", "FLOAT64"), ("categoria_max", "STRING"), ("nivel_aviso_max", "STRING"),
-                       ("fuente", "STRING")]
+                       ("fuente", "STRING"), ("acum_7d_valle", "FLOAT64"), ("cuenca_alta", "STRING"),
+                       ("max_dia_cuenca", "FLOAT64"), ("acum_3d_cuenca", "FLOAT64"), ("acum_7d_cuenca", "FLOAT64"),
+                       ("categoria_cuenca", "STRING"), ("indicio_origen", "STRING")]
 
 
 # ------------------------------------------------------------------ Principal
@@ -255,6 +304,7 @@ if __name__ == "__main__":
         nuevos["actualizado_en"] = datetime.now(timezone.utc)
     sat = pd.concat([d for d in (previo, nuevos) if d is not None and not d.empty], ignore_index=True)
     sat = sat.drop_duplicates(["zona", "fecha"], keep="last").sort_values(["zona", "fecha"])
+    sat = acumulados(sat)
 
     # 2. Contraste con el pronóstico
     print("2. Contraste pronóstico vs satélite...")
@@ -263,7 +313,11 @@ if __name__ == "__main__":
         resumen = con[con["dias_adelante"] == 1].groupby("zona").agg(
             pares=("error_media", "size"), pron=("lluvia_media_pronostico", "mean"),
             sat=("lluvia_media_satelite", "mean"), error=("error_media", "mean"))
-        print("   Pronóstico a 1 día vs satélite (promedios diarios, mm):")
+        if resumen.empty:
+            print(f"   Hay {len(con)} pares del mismo día (pronóstico de 0 días), pero aún no pronósticos emitidos "
+                  f"con 1 día de anticipación. El resumen aparecerá en los próximos días.")
+        else:
+            print("   Pronóstico a 1 día vs satélite (promedios diarios, mm):")
         for z, r in resumen.iterrows():
             print(f"   {z:18s} {int(r.pares):3d} días | pronóstico {r.pron:5.2f} | satélite {r.sat:5.2f} | "
                   f"diferencia {r.error:+5.2f}")
@@ -272,14 +326,19 @@ if __name__ == "__main__":
 
     # 3. Eventos históricos (una sola vez)
     ev_sat = None if a.reconstruir_eventos else leer_tabla("BQ_TABLA_EVENTOS_SAT", "eventos_satelite")
+    if ev_sat is not None and "indicio_origen" not in ev_sat.columns:
+        print("3. La tabla de eventos es de la versión anterior: se recalcula con la cuenca alta.")
+        ev_sat = None
     if ev_sat is None:
         print(f"3. Eventos INDECI con {PRODUCTO_HISTORICO[2]} (solo la primera vez)...")
         ev_sat = eventos_satelite(zonas_celdas, umbrales)
         if ev_sat is not None and not ev_sat.empty:
             print("   Guardado en:", guardar(ev_sat, "BQ_TABLA_EVENTOS_SAT", "eventos_satelite", ESQUEMA_EVENTOS_SAT))
+            print("   fecha       zona        valle máx.  cuenca: 3 d / 7 d     indicio")
             for _, r in ev_sat.sort_values("fecha").iterrows():
-                print(f"   {r.fecha} {r.zona:11s} máx. {r.lluvia_max_dia} mm/día -> {r.categoria_max} "
-                      f"({r.localidades or 'sin localidad'})")
+                cuenca = (f"{r.acum_3d_cuenca:5.1f} / {r.acum_7d_cuenca:5.1f} mm" if pd.notna(r.acum_3d_cuenca)
+                          else "      sin dato     ")
+                print(f"   {r.fecha} {r.zona:11s} {r.lluvia_max_dia:6.1f} mm  {cuenca}  {r.indicio_origen}")
     else:
         print("3. Eventos INDECI: ya calculados (usa --reconstruir-eventos para repetir).")
 
