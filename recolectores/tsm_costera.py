@@ -296,12 +296,15 @@ ARCHIVO_NCEI = re.compile(r'href="(oisst-avhrr-v02r01\.(\d{8})(_preliminary)?\.n
 DIAS_REVISION_NCEI = 30        # ventana máxima hacia atrás que se revisa en cada ejecución
 
 
-def http_get(url, intentos=3):
+def http_get(url, intentos=3, permitir_404=False):
+    """permitir_404=True: un 404 significa 'todavía no publicado' y devuelve None en vez de fallar."""
     for i in range(intentos):
         try:
             r = requests.get(url, timeout=180, headers={"User-Agent": "monitoreo-nino/1.0 (uso interno)"})
             if r.status_code == 200:
                 return r
+            if r.status_code == 404 and permitir_404:
+                return None
             mensaje = " ".join(r.text.split())[:300]
             print(f"   [NCEI] intento {i + 1}: HTTP {r.status_code} -> {mensaje}", flush=True)
             if r.status_code in (403, 404):
@@ -314,7 +317,11 @@ def http_get(url, intentos=3):
 
 def indice_mes(anio_mes):
     """Lista de archivos disponibles en el directorio mensual: {fecha: {'final': nombre, 'preliminar': nombre}}."""
-    html = http_get(f"{NCEI_URL}/{anio_mes}/").text
+    r = http_get(f"{NCEI_URL}/{anio_mes}/", permitir_404=True)
+    if r is None:   # p. ej. el 1 o 2 del mes: NOAA aún no publica ningún archivo de ese mes
+        print(f"   NCEI: el mes {anio_mes} aún no tiene archivos publicados (normal al inicio de mes)")
+        return {}
+    html = r.text
     disponibles = {}
     for nombre, ymd, prelim in ARCHIVO_NCEI.findall(html):
         d = datetime.strptime(ymd, "%Y%m%d").date()
