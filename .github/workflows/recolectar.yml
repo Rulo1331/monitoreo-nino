@@ -4,7 +4,8 @@ name: Recolectar datos El Niño
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # todos los días 12:00 UTC = 07:00 hora de Perú
+    - cron: "17 10 * * *"  # todos los días 10:17 UTC = 05:17 hora de Perú (lejos del inicio de la hora,
+                           # con margen para que, aun con demora de GitHub, los datos estén antes de las 7:00)
                            # (la TSM costera es diaria; los demás pasos no duplican datos)
   workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
 
