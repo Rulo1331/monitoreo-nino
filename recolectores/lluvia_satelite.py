@@ -44,18 +44,30 @@ CAJA = (-79.4, -10.4, -77.0, -7.7)           # lon_min, lat_min, lon_max, lat_ma
 
 
 # ------------------------------------------------------------------ Acceso a NASA
-def iniciar_sesion():
+def iniciar_sesion(intentos=3):
+    """Login en NASA Earthdata con reintentos. Si NASA no responde, devuelve False (no es un error de datos:
+    la próxima ejecución recupera los días pendientes, porque siempre retoma desde el último dato guardado)."""
+    import urllib3.util.connection as conexion
+    conexion.HAS_IPV6 = False          # los servidores de GitHub Actions no tienen salida IPv6
     import earthaccess
     os.environ.setdefault("EARTHDATA_USERNAME", os.getenv("EARTHDATA_USER", ""))
     os.environ.setdefault("EARTHDATA_PASSWORD", os.getenv("EARTHDATA_PASS", ""))
     if not os.environ["EARTHDATA_USERNAME"] or not os.environ["EARTHDATA_PASSWORD"]:
         print("ERROR: faltan los secrets EARTHDATA_USER y/o EARTHDATA_PASS.")
         sys.exit(1)
-    auth = earthaccess.login(strategy="environment")
-    if not getattr(auth, "authenticated", False):
-        print("ERROR: NASA Earthdata rechazó el usuario o la contraseña.")
-        sys.exit(1)
-    print("Sesión NASA Earthdata iniciada.")
+    for i in range(intentos):
+        try:
+            auth = earthaccess.login(strategy="environment")
+        except Exception as e:   # caída o problema de red en NASA
+            print(f"   [NASA] intento {i + 1}: sin conexión con Earthdata ({type(e).__name__})", flush=True)
+            time.sleep(30 * (i + 1))
+            continue
+        if not getattr(auth, "authenticated", False):
+            print("ERROR: NASA Earthdata rechazó el usuario o la contraseña.")
+            sys.exit(1)
+        print("Sesión NASA Earthdata iniciada.")
+        return True
+    return False
 
 
 def fecha_granulo(g):
@@ -302,7 +314,10 @@ if __name__ == "__main__":
     ap.add_argument("--reconstruir-eventos", action="store_true")
     a = ap.parse_args()
 
-    iniciar_sesion()
+    if not iniciar_sesion():
+        print("AVISO: NASA Earthdata no respondió. Hoy no se actualiza el satélite; la próxima ejecución "
+              "recuperará los días pendientes. Si se repite varios días, la validación 'dato reciente' avisará.")
+        sys.exit(0)
     zonas_celdas = celdas_por_zona()
     print("Celdas IMERG por zona: " + ", ".join(f"{z} {len(c)}" for z, c in zonas_celdas.items()))
     umb = leer_tabla("BQ_TABLA_LLUVIA_UMBRALES", "lluvia_umbrales")
