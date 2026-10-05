@@ -21,15 +21,36 @@ st.set_page_config(page_title="Monitoreo El Niño – Virú y Chao", page_icon="
 # ------------------------------------------------------------------ Configuración y datos
 RAIZ = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RAIZ / "recolectores"))
+
+# --- Credenciales: se leen de st.secrets y se registran los problemas en lugar de ocultarlos
+DIAG = {"claves_secrets": [], "error_secrets": None}
 try:
+    DIAG["claves_secrets"] = list(st.secrets.keys())
     for clave in ("GCP_SA_KEY", "BQ_PROYECTO", "BQ_DATASET"):
         if clave in st.secrets:
-            os.environ[clave] = str(st.secrets[clave])
-except Exception:
-    pass  # sin archivo de secrets: modo local de prueba
+            os.environ[clave] = str(st.secrets[clave]).strip()
+except Exception as e:  # sin secrets, o el bloque de secrets tiene un error de formato TOML
+    DIAG["error_secrets"] = ("no hay secrets configurados" if "SecretNotFound" in type(e).__name__
+                             else f"error de formato en los secrets: {type(e).__name__}: {e}")
 
 import lluvia as L          # zonas, umbrales y lectura de tablas (misma fuente que los recolectores)
 import tsm_costera as T     # coordenadas de los puertos
+import senamhi_nowcasting as SN   # aviso de lluvia a muy corto plazo (SENAMHI, IDESEP)
+
+
+@st.cache_data(ttl=300, show_spinner="Consultando el aviso de SENAMHI...")
+def nowcasting():
+    """Última emisión del nowcasting y sus tres horizontes. Se renueva cada 5 minutos."""
+    emision = SN.ultima_emision()
+    if emision is None:
+        return None, {}
+    datos = {}
+    for nombre, minutos in SN.HORIZONTES.items():
+        try:
+            datos[nombre] = SN.consultar(SN.nombre_fichero(emision, minutos))
+        except Exception as e:
+            datos[nombre] = {"features": [], "error": f"{type(e).__name__}"}
+    return emision, datos
 
 AZUL, ROJO, AMBAR, GRIS, FONDO, PANEL, LINEA = "#7CC6E8", "#F06B4F", "#F2A541", "#9FB0C0", "#0C141C", "#131E28", "#22313F"
 TEMP = ["DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "OND", "NDJ"]
@@ -37,9 +58,63 @@ MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "
 
 
 @st.cache_data(ttl=3600, show_spinner="Leyendo datos...")
-def tabla(nombre):
-    df = L.leer_tabla("__SIN_ENV__", nombre)
-    return pd.DataFrame() if df is None else df
+def tabla(nombre, proyecto, dataset, firma_clave):
+    """Devuelve (DataFrame, error). Nunca oculta el motivo de un fallo.
+    proyecto, dataset y firma_clave forman parte de la llave de la caché: si cambian los secrets,
+    los datos se vuelven a leer en vez de reutilizar un fallo anterior."""
+    if not proyecto:
+        df = L.leer_tabla("__SIN_ENV__", nombre)          # modo local de prueba (datos_nino.db)
+        return (pd.DataFrame(), "sin BQ_PROYECTO y sin base local") if df is None else (df, None)
+    try:
+        from google.api_core.exceptions import NotFound
+        cliente = L.cliente_bigquery(proyecto)
+        ruta = L.ruta_bq(proyecto, nombre)[1]
+        df = cliente.list_rows(ruta).to_dataframe(create_bqstorage_client=False)
+        for c in ("fecha", "emitido"):
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c]).dt.date
+        return df, None
+    except NotFound:
+        return pd.DataFrame(), f"no existe {L.ruta_bq(proyecto, nombre)[1]}"
+    except Exception as e:
+        return pd.DataFrame(), f"{type(e).__name__}: {str(e)[:300]}"
+
+
+def diagnostico(errores):
+    """Explica en pantalla por qué no se pudieron leer los datos."""
+    st.error("No se pudieron leer los datos. Diagnóstico:")
+    proyecto, dataset = os.getenv("BQ_PROYECTO"), os.getenv("BQ_DATASET") or "monitoreo_nino (valor por defecto)"
+    if DIAG["error_secrets"]:
+        st.markdown(f"- ❌ **Secrets:** {DIAG['error_secrets']}")
+    st.markdown(f"- Claves encontradas en los secrets: `{', '.join(DIAG['claves_secrets']) or 'ninguna'}` "
+                f"(se necesitan `GCP_SA_KEY`, `BQ_PROYECTO` y `BQ_DATASET`)")
+    st.markdown(f"- Proyecto: `{proyecto or 'NO DEFINIDO'}` · Dataset: `{dataset}`")
+    if os.getenv("GCP_SA_KEY"):
+        try:
+            import json
+            correo = json.loads(os.environ["GCP_SA_KEY"])["client_email"]
+            st.markdown(f"- ✅ Clave JSON válida · cuenta de servicio: `{correo}`")
+        except Exception as e:
+            st.markdown(f"- ❌ **GCP_SA_KEY no es un JSON válido:** `{type(e).__name__}: {str(e)[:150]}`")
+    elif proyecto:
+        st.markdown("- ❌ **Falta GCP_SA_KEY** en los secrets")
+    if proyecto:
+        try:
+            cliente = L.cliente_bigquery(proyecto)
+            datasets = [d.dataset_id for d in cliente.list_datasets(proyecto)]
+            st.markdown(f"- Datasets que esta cuenta puede ver en `{proyecto}`: `{', '.join(datasets) or 'ninguno'}`")
+            ds = L.ruta_bq(proyecto, "x")[0]
+            tablas = [t.table_id for t in cliente.list_tables(ds)]
+            st.markdown(f"- Tablas en `{ds}`: `{', '.join(tablas) or 'ninguna'}`")
+        except Exception as e:
+            st.markdown(f"- ❌ **Error al consultar BigQuery:** `{type(e).__name__}: {str(e)[:300]}`")
+    st.markdown("**Detalle por tabla:**")
+    for n, err in errores.items():
+        st.markdown(f"- `{n}`: {err}")
+    st.info("Después de corregir los secrets, usa el botón de abajo para volver a cargar los datos.")
+    if st.button("Volver a cargar los datos"):
+        st.cache_data.clear()
+        st.rerun()
 
 
 def estilo(fig, titulo_x, titulo_y, alto=360):
@@ -73,12 +148,16 @@ def bandas(fig, tramos, eje_x0, eje_x1):
         fig.add_annotation(x=eje_x1, y=(y0 + y1) / 2, text=texto, showarrow=False, xanchor="right", font=dict(size=10, color=GRIS))
 
 
-icen, roni, sem = tabla("icen"), tabla("roni"), tabla("nino_semanal")
-tsm, zonas_df, puntos = tabla("tsm_costera"), tabla("lluvia_zonas"), tabla("lluvia_puntos")
-umbr, sat, ev = tabla("lluvia_umbrales"), tabla("lluvia_satelite"), tabla("eventos_satelite")
-faltan = [n for n, d in (("icen", icen), ("roni", roni), ("tsm_costera", tsm), ("lluvia_zonas", zonas_df)) if d.empty]
-if faltan:
-    st.error(f"No se encontraron las tablas: {', '.join(faltan)}. Revisa los secrets o ejecuta los recolectores.")
+NOMBRES = ["icen", "roni", "nino_semanal", "tsm_costera", "lluvia_zonas", "lluvia_puntos", "lluvia_umbrales", "lluvia_satelite", "eventos_satelite"]
+import hashlib
+FIRMA = hashlib.sha256((os.getenv("GCP_SA_KEY") or "").encode()).hexdigest()[:12]
+LEIDAS = {n: tabla(n, os.getenv("BQ_PROYECTO"), os.getenv("BQ_DATASET"), FIRMA) for n in NOMBRES}
+icen, roni, sem = (LEIDAS[n][0] for n in ("icen", "roni", "nino_semanal"))
+tsm, zonas_df, puntos = (LEIDAS[n][0] for n in ("tsm_costera", "lluvia_zonas", "lluvia_puntos"))
+umbr, sat, ev = (LEIDAS[n][0] for n in ("lluvia_umbrales", "lluvia_satelite", "eventos_satelite"))
+esenciales = ["icen", "roni", "tsm_costera", "lluvia_zonas", "lluvia_puntos"]
+if any(LEIDAS[n][0].empty for n in esenciales):
+    diagnostico({n: LEIDAS[n][1] or "OK" for n in NOMBRES})
     st.stop()
 
 # Preparación
@@ -205,6 +284,35 @@ with v2:
     import folium
     from streamlit_folium import st_folium
 
+    p_ult = puntos[puntos["emitido"] == puntos["emitido"].max()].drop_duplicates(["zona", "lat", "lon"])
+    st.subheader("Aviso de lluvia SENAMHI en tiempo real")
+    try:
+        emision_nc, datos_nc = nowcasting()
+    except Exception:
+        emision_nc, datos_nc = None, {}
+    geo_nc = None
+    if emision_nc is None:
+        st.warning("No se pudo consultar el aviso de SENAMHI (IDESEP) en este momento. Se reintentará en 5 minutos.")
+    else:
+        hz = st.radio("Horizonte del aviso", list(SN.HORIZONTES), horizontal=True)
+        valido = emision_nc + timedelta(minutes=SN.HORIZONTES[hz])
+        st.caption(f"Emisión {emision_nc:%d-%b %H:%M} · válido para las {valido:%H:%M} (hora de Perú) · "
+                   "fuente: SENAMHI, nowcasting vía IDESEP · se actualiza cada 10 min")
+        geo_nc = datos_nc.get(hz, {"features": []})
+        pts_zona = {z["zona"]: list(zip(p_ult[p_ult.zona == z["zona"]].lat, p_ult[p_ult.zona == z["zona"]].lon)) for z in L.ZONAS}
+        filas_nc = SN.resumen_zonas(geo_nc, pts_zona)   # en el orden de las zonas: valles primero
+        cols_nc = st.columns(len(filas_nc))
+        for col, f in zip(cols_nc, filas_nc):
+            fondo, texto = SN.COLORES.get(f["nivel_max"], "#FFFFFF"), "#0C141C"
+            if f["nivel_max"] == 0:
+                fondo, texto = PANEL, "#E6EDF3"
+            col.markdown(f"<div style='background:{fondo};color:{texto};border:1px solid {LINEA};border-radius:10px;padding:10px'>"
+                         f"<div style='font-size:12px'>{f['zona']}</div><div style='font-weight:700'>{f['aviso']}</div>"
+                         f"<div style='font-size:12px'>{f['pct_area_con_aviso']:.0f}% del área</div></div>", unsafe_allow_html=True)
+        if "error" in geo_nc:
+            st.caption(f"Este horizonte no pudo descargarse ({geo_nc['error']}).")
+    st.divider()
+
     var = st.radio("Variable del mapa", ["Próximos 7 días (mm)", "Últimos 7 días (mm)", "Probabilidad >5 mm (%)"], horizontal=True)
     campo = {"Próximos 7 días (mm)": "futuro", "Últimos 7 días (mm)": "pasado", "Probabilidad >5 mm (%)": "prob"}[var]
     cortes = [20, 50, 80] if campo == "prob" else [5, 15, 30]
@@ -219,7 +327,14 @@ with v2:
             r = resumen_z.loc[z["zona"]]
             folium.Polygon([(a, b) for a, b in z["poligono"]], color="#FFFFFF", weight=1, fill=True, fill_color=color_z(r[campo]), fill_opacity=0.55,
                            tooltip=f"<b>{z['zona']}</b><br>Últimos 7 d: {r.pasado:.1f} mm<br>Próximos 7 d: {r.futuro:.1f} mm<br>Prob. &gt;5 mm: {r.prob:.0f}%").add_to(g_z)
-        p_ult = puntos[puntos["emitido"] == puntos["emitido"].max()].drop_duplicates(["zona", "lat", "lon"])
+        if geo_nc:
+            g_nc = folium.FeatureGroup("Aviso SENAMHI (nowcasting)")
+            for f in geo_nc.get("features", []):
+                n = f["properties"].get("nivel") or 0
+                if n >= 1:
+                    folium.GeoJson(f, style_function=lambda _, c=SN.COLORES.get(n, "#FFFFFF"): {"fillColor": c, "color": c, "weight": 1, "fillOpacity": 0.55},
+                                   tooltip=f"SENAMHI: {SN.NIVELES.get(n, n)} · pp {f['properties'].get('ppmin')}–{f['properties'].get('ppmax')}").add_to(g_nc)
+            g_nc.add_to(m)
         celdas = set()
         for zona, gz in p_ult.groupby("zona"):
             for i, (_, p) in enumerate(gz.iterrows(), 1):
