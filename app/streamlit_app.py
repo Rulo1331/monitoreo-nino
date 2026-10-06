@@ -26,7 +26,7 @@ sys.path.insert(0, str(RAIZ / "recolectores"))
 DIAG = {"claves_secrets": [], "error_secrets": None}
 try:
     DIAG["claves_secrets"] = list(st.secrets.keys())
-    for clave in ("GCP_SA_KEY", "BQ_PROYECTO", "BQ_DATASET"):
+    for clave in ("GCP_SA_KEY", "BQ_PROYECTO", "BQ_DATASET", "NODERED_URL", "NODERED_TOKEN"):
         if clave in st.secrets:
             os.environ[clave] = str(st.secrets[clave]).strip()
 except Exception as e:  # sin secrets, o el bloque de secrets tiene un error de formato TOML
@@ -38,19 +38,27 @@ import tsm_costera as T     # coordenadas de los puertos
 import senamhi_nowcasting as SN   # aviso de lluvia a muy corto plazo (SENAMHI, IDESEP)
 
 
-@st.cache_data(ttl=300, show_spinner="Consultando el aviso de SENAMHI...")
-def nowcasting():
-    """Última emisión del nowcasting y sus tres horizontes. Se renueva cada 5 minutos."""
-    emision = SN.ultima_emision()
-    if emision is None:
-        return None, {}
-    datos = {}
-    for nombre, minutos in SN.HORIZONTES.items():
-        try:
-            datos[nombre] = SN.consultar(SN.nombre_fichero(emision, minutos))
-        except Exception as e:
-            datos[nombre] = {"features": [], "error": f"{type(e).__name__}"}
-    return emision, datos
+@st.cache_data(ttl=120, show_spinner=False)
+def nowcasting(base, token):
+    """Último aviso de SENAMHI guardado por Node-RED (que consulta IDESEP cada 5 minutos).
+    base y token son parte de la llave de la caché: si cambian los secrets, se vuelve a consultar.
+    Devuelve (emisión en hora de Perú, {horizonte: GeoJSON}, mensaje de error)."""
+    import requests
+    from datetime import datetime
+    if not base or not token:
+        return None, {}, "faltan NODERED_URL y/o NODERED_TOKEN en los secrets"
+    try:
+        r = requests.get(base.rstrip("/") + "/nowcasting/ultimo", params={"token": token}, timeout=8)
+    except requests.RequestException as e:
+        return None, {}, f"Node-RED no respondió ({type(e).__name__})"
+    if r.status_code != 200:
+        return None, {}, f"Node-RED respondió HTTP {r.status_code}: {r.text[:120]}"
+    d = r.json()
+    emision = datetime.strptime(d["emision"], "%Y%m%d-%H%M")
+    geo = {k: {"features": v.get("avisos", []), **({} if v.get("disponible") else {"error": "no disponible"})}
+           for k, v in d.get("horizontes", {}).items()}
+    return emision, geo, None
+
 
 AZUL, ROJO, AMBAR, GRIS, FONDO, PANEL, LINEA = "#7CC6E8", "#F06B4F", "#F2A541", "#9FB0C0", "#0C141C", "#131E28", "#22313F"
 TEMP = ["DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "OND", "NDJ"]
@@ -159,6 +167,16 @@ esenciales = ["icen", "roni", "tsm_costera", "lluvia_zonas", "lluvia_puntos"]
 if any(LEIDAS[n][0].empty for n in esenciales):
     diagnostico({n: LEIDAS[n][1] or "OK" for n in NOMBRES})
     st.stop()
+
+# BigQuery no garantiza el orden de las filas (y los días rellenados del histórico se agregaron al final).
+# Se ordena cada serie por fecha y se descartan días repetidos: así las líneas no "saltan" hacia atrás.
+if not tsm.empty:
+    tsm = tsm.sort_values(["punto", "fecha"]).drop_duplicates(["punto", "fecha"], keep="last").reset_index(drop=True)
+icen = icen.sort_values(["anio", "mes"]).drop_duplicates(["anio", "mes"], keep="last").reset_index(drop=True)
+if not sem.empty and "fecha" in sem:
+    sem = sem.sort_values("fecha").drop_duplicates("fecha", keep="last").reset_index(drop=True)
+if not sat.empty and {"zona", "fecha"} <= set(sat.columns):
+    sat = sat.sort_values(["zona", "fecha"]).reset_index(drop=True)
 
 # Preparación
 icen = icen.sort_values(["anio", "mes"])
@@ -286,18 +304,19 @@ with v2:
 
     p_ult = puntos[puntos["emitido"] == puntos["emitido"].max()].drop_duplicates(["zona", "lat", "lon"])
     st.subheader("Aviso de lluvia SENAMHI en tiempo real")
-    try:
-        emision_nc, datos_nc = nowcasting()
-    except Exception:
-        emision_nc, datos_nc = None, {}
+    emision_nc, datos_nc, error_nc = nowcasting(os.getenv("NODERED_URL"), os.getenv("NODERED_TOKEN"))
     geo_nc = None
     if emision_nc is None:
-        st.warning("No se pudo consultar el aviso de SENAMHI (IDESEP) en este momento. Se reintentará en 5 minutos.")
+        st.warning(f"Aviso de SENAMHI no disponible: {error_nc}.")
     else:
+        from datetime import datetime as _dt
+        atraso = (_dt.now(SN.LIMA).replace(tzinfo=None) - emision_nc).total_seconds() / 60
+        if atraso > 45:
+            st.warning(f"El último aviso guardado es de hace {atraso:.0f} minutos: revisar el flujo de Node-RED.")
         hz = st.radio("Horizonte del aviso", list(SN.HORIZONTES), horizontal=True)
         valido = emision_nc + timedelta(minutes=SN.HORIZONTES[hz])
         st.caption(f"Emisión {emision_nc:%d-%b %H:%M} · válido para las {valido:%H:%M} (hora de Perú) · "
-                   "fuente: SENAMHI, nowcasting vía IDESEP · se actualiza cada 10 min")
+                   "fuente: SENAMHI, nowcasting vía IDESEP · recolectado por Node-RED cada 5 min")
         geo_nc = datos_nc.get(hz, {"features": []})
         pts_zona = {z["zona"]: list(zip(p_ult[p_ult.zona == z["zona"]].lat, p_ult[p_ult.zona == z["zona"]].lon)) for z in L.ZONAS}
         filas_nc = SN.resumen_zonas(geo_nc, pts_zona)   # en el orden de las zonas: valles primero
