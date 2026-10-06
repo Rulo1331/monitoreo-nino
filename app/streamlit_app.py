@@ -292,10 +292,16 @@ with v1:
         fig = go.Figure()
         for a, col_ in [(anio, AZUL), (ult_dia.year, ROJO)]:
             s = tsm[(tsm.punto == "Salaverry") & (tsm.fecha.dt.year == a)]
-            fig.add_scatter(x=s.fecha.dt.dayofyear, y=s.anom_1991_2020, mode="lines", name=str(a), line=dict(color=col_, width=2.5 if col_ == ROJO else 1.8))
+            # Todas las series se llevan a un mismo año de referencia (2000, bisiesto) para comparar por mes y día;
+            # la fecha real se muestra al pasar el cursor.
+            x_ref = pd.to_datetime({"year": 2000, "month": s.fecha.dt.month, "day": s.fecha.dt.day})
+            fig.add_scatter(x=x_ref, y=s.anom_1991_2020, mode="lines", name=str(a), customdata=s.fecha.dt.strftime("%d/%m/%Y"),
+                            hovertemplate="%{customdata}<br>Anomalía: %{y:+.2f} °C<extra>" + str(a) + "</extra>",
+                            line=dict(color=col_, width=2.5 if col_ == ROJO else 1.8))
         fig.add_hline(y=0, line_color=GRIS)
+        fig.update_xaxes(tickvals=pd.date_range("2000-01-01", periods=12, freq="MS"), ticktext=MESES, range=["2000-01-01", "2000-12-31"])
         st.markdown(f"**Mar frente a Salaverry: {ult_dia.year} vs {anio}** (anomalía diaria)")
-        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Día del año", "Anomalía de temperatura (°C)", 320))
+        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía de temperatura (°C)", 320))
 
 # ================================================================== VISTA 2: TERRITORIO Y LLUVIA
 with v2:
