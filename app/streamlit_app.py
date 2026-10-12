@@ -502,7 +502,7 @@ with v3:
             st.markdown("**Mapa de calor: regiones Niño por semana** (T: tradicional · R: relativa)")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana (centrada en miércoles)", "Serie"))
 # ================================================================== VISTA 5: EVENTOS HISTÓRICOS
-with v5:
+with v4:
   render_monitoreo_hidrologico()
 
 
