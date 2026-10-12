@@ -503,7 +503,7 @@ with v3:
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana (centrada en miércoles)", "Serie"))
 # ================================================================== VISTA 5: EVENTOS HISTÓRICOS
 with v4:
-  render_monitoreo_hidrologico()
+    render_monitoreo_hidrologico(cliente_fn=lambda: L.cliente_bigquery(os.getenv("BQ_PROYECTO")))
 
 
 # ================================================================== VISTA 5: EVENTOS HISTÓRICOS
