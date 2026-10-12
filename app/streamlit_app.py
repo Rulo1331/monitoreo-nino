@@ -16,6 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from monitoreo_hidrologico import render_monitoreo_hidrologico
 st.set_page_config(page_title="Monitoreo El Niño – Virú y Chao", page_icon="🌊", layout="wide")
 
 # ------------------------------------------------------------------ Configuración y datos
@@ -204,7 +205,7 @@ st.title("Océano, lluvia y territorio: Virú, Chao y costa norte")
 st.caption(f"Mar al {ult_dia:%d-%b-%Y} · Lluvia emitida {ult_em} · ICEN {MESES[int(ult_icen.mes) - 1]}-{int(ult_icen.anio)} · "
            f"Semanal {sem['semana'].max() if not sem.empty else '—'}")
 
-v1, v2, v3, v4, v5 = st.tabs(["Panorama e historia", "Territorio y lluvia", "Océano", "Eventos históricos", "Resumen automático"])
+v1, v2, v3, v4, v5, v6 = st.tabs(["Panorama e historia", "Territorio y lluvia", "Océano", "Monitoreo Hidrológico", "Eventos históricos", "Resumen automático"])
 
 # ================================================================== VISTA 1: PANORAMA E HISTORIA
 with v1:
@@ -500,9 +501,13 @@ with v3:
                                        text=[[f"{x:+.1f}" for x in fila] for fila in z], texttemplate="%{text}", colorbar=dict(title="°C")))
             st.markdown("**Mapa de calor: regiones Niño por semana** (T: tradicional · R: relativa)")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana (centrada en miércoles)", "Serie"))
+# ================================================================== VISTA 5: EVENTOS HISTÓRICOS
+with v5:
+  render_monitoreo_hidrologico()
 
-# ================================================================== VISTA 4: EVENTOS HISTÓRICOS
-with v4:
+
+# ================================================================== VISTA 5: EVENTOS HISTÓRICOS
+with v5:
     if ev.empty:
         st.info("La tabla eventos_satelite aún no existe.")
     else:
@@ -526,8 +531,8 @@ with v4:
                                       "indicio_origen": "indicio", "roni": "RONI ese mes"}).sort_values("fecha"),
                      hide_index=True, width="stretch")
 
-# ================================================================== VISTA 5: RESUMEN AUTOMÁTICO
-with v5:
+# ================================================================== VISTA 6: RESUMEN AUTOMÁTICO
+with v6:
     st.caption("Resumen generado con reglas a partir de los datos del día (sin IA). Es la base sobre la que un modelo de lenguaje "
                "redactaría el resumen ejecutivo en una fase posterior.")
     vig = resumen_z[(resumen_z.index.str.startswith("Cuenca")) & (resumen_z.futuro >= 30)]
