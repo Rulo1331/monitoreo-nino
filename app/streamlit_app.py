@@ -205,10 +205,10 @@ st.title("Océano, lluvia y territorio: Virú, Chao y costa norte")
 st.caption(f"Mar al {ult_dia:%d-%b-%Y} · Lluvia emitida {ult_em} · ICEN {MESES[int(ult_icen.mes) - 1]}-{int(ult_icen.anio)} · "
            f"Semanal {sem['semana'].max() if not sem.empty else '—'}")
 
-v1, v2, v3, v4, v5, v6 = st.tabs(["Panorama e historia", "Territorio y lluvia", "Océano", "Monitoreo Hidrológico", "Eventos históricos", "Resumen automático"])
+v4, v2, v3, v1, v5, v6 = st.tabs(["Panorama e historia", "Territorio y lluvia", "Océano", "Monitoreo Hidrológico", "Eventos históricos", "Resumen automático"])
 
 # ================================================================== VISTA 1: PANORAMA E HISTORIA
-with v1:
+with v4:
     c1, c2, c3 = st.columns([3, 1.2, 1.4])
     atajos = {"1972-73": 1972, "1982-83": 1982, "1997-98": 1997, "2015-16": 2015, "2017 (costero)": 2017, "2023-24": 2023, "Otro año": None}
     eleccion = c1.radio("Comparar 2026 con", list(atajos), index=2, horizontal=True)
@@ -502,7 +502,7 @@ with v3:
             st.markdown("**Mapa de calor: regiones Niño por semana** (T: tradicional · R: relativa)")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana (centrada en miércoles)", "Serie"))
 # ================================================================== VISTA 5: EVENTOS HISTÓRICOS
-with v4:
+with v1:
     render_monitoreo_hidrologico(cliente_fn=lambda: L.cliente_bigquery(os.getenv("BQ_PROYECTO")))
 
 
