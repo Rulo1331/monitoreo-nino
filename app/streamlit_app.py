@@ -205,7 +205,7 @@ st.title("Océano, lluvia y territorio: Virú, Chao y costa norte")
 st.caption(f"Mar al {ult_dia:%d-%b-%Y} · Lluvia emitida {ult_em} · ICEN {MESES[int(ult_icen.mes) - 1]}-{int(ult_icen.anio)} · "
            f"Semanal {sem['semana'].max() if not sem.empty else '—'}")
 
-v4, v2, v3, v1, v5, v6 = st.tabs(["Panorama e historia", "Territorio y lluvia", "Océano", "Monitoreo Hidrológico", "Eventos históricos", "Resumen automático"])
+v1, v2, v3, v4, v5, v6 = st.tabs(["Monitoreo Hidrológico", "Territorio y lluvia", "Océano", "Panorama e historia", "Eventos históricos", "Resumen automático"])
 
 # ================================================================== VISTA 1: PANORAMA E HISTORIA
 with v4:
