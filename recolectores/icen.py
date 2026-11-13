@@ -1,213 +1,376 @@
 """
-Recolector del Índice Costero El Niño (ICEN) — Variable 1 del dashboard.
+Recolector de la variable 1: Índice Costero El Niño (ICEN).
 
-Definición oficial (ENFEN, Nota Técnica 01-2024): media móvil de 3 meses de las
-anomalías mensuales de TSM en la región Niño 1+2 (ERSSTv5), climatología 1991-2020.
+Fuente principal: archivo oficial del IGP/ENFEN
+    http://met.igp.gob.pe/datos/ICEN.txt
+(es el enlace de descarga de la página SIOFEN de IMARPE).
 
-Fuente: NOAA CPC publica esas anomalías mensuales en texto plano y permite
-acceso automatizado. Calculamos el ICEN nosotros y lo contrastamos con el
-valor oficial del ENFEN (que prevalece ante cualquier discrepancia).
+Respaldo manual: datos/icen_manual.csv
+    Solo se usa para los meses que el archivo del IGP todavía no trae.
+
+Qué hace en cada ejecución:
+ 1. Descarga ICEN.txt y lo valida (formato, meses continuos, rango de valores).
+ 2. Lee los valores cargados a mano (si hay).
+ 3. Lee la tabla actual de BigQuery para conservar las columnas que el IGP no
+    publica (anom_nino12 y anom_nino34, que venían de NOAA ERSSTv5).
+ 4. Arma la serie completa, clasifica cada mes con los umbrales del ENFEN y
+    reemplaza la tabla.
+
+Si el IGP no responde, no borra nada: conserva el ICEN que ya estaba en la
+tabla, aplica los valores manuales y termina con un AVISO (código 0).
 
 Uso:
-  python icen.py                       # descarga, calcula y guarda
-  python icen.py --archivo muestra.txt # usa un archivo local (pruebas)
-  python icen.py --validar             # compara con valores oficiales conocidos
+    python recolectores/icen.py --validar      # valida y guarda (lo que corre GitHub)
+    python recolectores/icen.py --no-guardar   # solo muestra el resultado
 
-Destino de los datos:
-  - Si existe la variable BQ_PROYECTO  -> BigQuery (tabla <BQ_PROYECTO>.<BQ_DATASET>.<BQ_TABLA_ICEN>)
-      BQ_DATASET    (opcional, por defecto 'monitoreo_nino'; admite 'otro_proyecto.dataset')
-      BQ_TABLA_ICEN (opcional, por defecto 'icen')
-      Credenciales: GCP_SA_KEY (contenido JSON, usado en GitHub Actions) o
-      GOOGLE_APPLICATION_CREDENTIALS (ruta al archivo JSON, usado en tu PC).
-  - Si no existe                       -> SQLite local 'datos_nino.db' (pruebas).
+Variables de entorno (las mismas de antes):
+    GCP_SA_KEY      JSON de la cuenta de servicio (secret de GitHub)
+    BQ_PROYECTO     proyecto de BigQuery
+    BQ_DATASET      dataset (puede ser "otro-proyecto.dataset")
+    BQ_TABLA_ICEN   nombre de la tabla (por defecto "icen")
 """
-import argparse, json, os, re, sqlite3, sys
-from datetime import datetime, timezone
-import numpy as np
+
+import argparse
+import datetime as dt
+import io
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
 import pandas as pd
 import requests
 
-URL_NOAA = ("https://www.cpc.ncep.noaa.gov/products/GODAS/multiora/index/"
-            "mnth.ersstv5.clim19912020.nino_current.txt")
-FILA = re.compile(r"^\s*(\d{4})\s+(\d{1,2})\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
+# ----------------------------------------------------------------------------
+# Configuración
+# ----------------------------------------------------------------------------
+URL_IGP = os.environ.get("ICEN_URL", "http://met.igp.gob.pe/datos/ICEN.txt")
+RUTA_MANUAL = Path(__file__).resolve().parent.parent / "datos" / "icen_manual.csv"
 
-# Valores oficiales publicados, para validar el cálculo (fuente: Informe Técnico ENFEN 06-2026)
-REFERENCIAS_OFICIALES = {(2026, 5): 1.98}   # ICEN centrado en mayo 2026
-TOLERANCIA = 0.05                            # °C (diferencias por redondeo de NOAA)
+FUENTE_IGP = "IGP/ENFEN ICEN.txt (oficial)"
+FUENTE_MANUAL = "Manual"
 
-# Umbrales ENFEN (Nota Técnica 01-2024). Neutra, débil y moderada están confirmados
-# en los comunicados; revisa en la Nota Técnica el límite de "extraordinaria".
-UMBRAL_FRIA = -0.7
+# Umbrales ENFEN para condiciones cálidas (°C).
+# UMBRAL_EXTRAORDINARIA = 3.0 es provisional: confirmarlo en la Nota Técnica
+# ENFEN 01-2024. Si encuentras el valor exacto, cambia solo este número.
+UMBRAL_NEUTRA_FRIA = -0.7
 UMBRAL_DEBIL = 0.5
 UMBRAL_MODERADA = 1.3
 UMBRAL_FUERTE = 2.1
-UMBRAL_EXTRAORDINARIA = None   # completar con el valor de la Nota Técnica 01-2024
+UMBRAL_EXTRAORDINARIA = 3.0
+
+MESES_PROVISIONALES = 2      # últimos meses que aún pueden corregirse
+MINIMO_FILAS_IGP = 900       # desde 1950 deben ser > 900 meses
+RANGO_VALIDO = (-4.0, 6.5)   # fuera de esto, el archivo cambió o está dañado
+
+# Valor oficial publicado por el ENFEN, para comprobar que leemos bien el archivo
+# (Informe Técnico SENAMHI-ENFEN N° 06-2026: ICEN de mayo 2026 = +1,98).
+CONTROL_OFICIAL = {(2026, 5): 1.98}
+
+COLUMNAS = ["anio", "mes", "anom_nino12", "icen", "categoria", "provisional",
+            "anom_nino34", "fuente", "actualizado_en"]
 
 
-def descargar(url=URL_NOAA):
-    r = requests.get(url, timeout=60, headers={"User-Agent": "monitoreo-nino/1.0 (uso interno)"})
-    r.raise_for_status()
-    return r.text
+# ----------------------------------------------------------------------------
+# 1. Descarga
+# ----------------------------------------------------------------------------
+def descargar(url: str, intentos: int = 3) -> str | None:
+    """Devuelve el texto del archivo o None si no se pudo descargar."""
+    cabeceras = {"User-Agent": "monitoreo-fen-elrocio/1.0 (descarga semanal del ICEN)"}
+    for i in range(1, intentos + 1):
+        try:
+            r = requests.get(url, headers=cabeceras, timeout=60)
+            r.raise_for_status()
+            r.encoding = r.encoding or "utf-8"
+            return r.text
+        except requests.RequestException as e:
+            print(f"   Intento {i}/{intentos} falló: {e}")
+            if i < intentos:
+                time.sleep(20 * i)
+    return None
 
 
-def parsear(texto):
-    """Extrae año, mes y anomalías Niño 1+2 y Niño 3.4 del archivo de NOAA."""
+# ----------------------------------------------------------------------------
+# 2. Lectura y validación del archivo del IGP
+# ----------------------------------------------------------------------------
+def parsear_igp(texto: str) -> pd.DataFrame:
+    """Convierte ICEN.txt en una tabla anio, mes, icen. Falla con mensaje claro
+    si el formato cambió."""
+    cabecera = [l for l in texto.splitlines() if l.strip().startswith("%")]
+    if not any("ICEN" in l for l in cabecera):
+        raise ValueError("El archivo no tiene la cabecera '% ... ICEN'. "
+                         "¿El IGP cambió el formato o devolvió una página de error?")
+
     filas = []
-    for linea in texto.splitlines():
-        m = FILA.match(linea)
-        if not m:
-            continue  # encabezados y líneas vacías
-        anio, mes, _n4, n34, _n3, n12 = m.groups()
-        num = lambda v: np.nan if "*" in v else float(v)   # '********' = mes sin dato
-        filas.append({"anio": int(anio), "mes": int(mes),
-                      "anom_nino12": num(n12), "anom_nino34": num(n34)})
-    if not filas:
-        raise ValueError("No se encontraron datos: ¿cambió el formato del archivo?")
-    df = pd.DataFrame(filas)
-    df["periodo"] = pd.PeriodIndex.from_fields(year=df.anio, month=df.mes, freq="M")
-    # Serie mensual continua: los huecos quedan como NaN y no contaminan la media móvil
-    completo = pd.period_range(df.periodo.min(), df.periodo.max(), freq="M")
-    return df.set_index("periodo").reindex(completo).rename_axis("periodo")
+    for n, linea in enumerate(texto.splitlines(), start=1):
+        s = linea.strip()
+        if not s or s.startswith("%"):
+            continue
+        partes = s.split()
+        if len(partes) != 3:
+            raise ValueError(f"Línea {n} con formato inesperado: '{s}'")
+        try:
+            filas.append((int(partes[0]), int(partes[1]), float(partes[2])))
+        except ValueError:
+            raise ValueError(f"Línea {n} no es 'año mes valor': '{s}'")
+
+    df = pd.DataFrame(filas, columns=["anio", "mes", "icen"])
+
+    if len(df) < MINIMO_FILAS_IGP:
+        raise ValueError(f"Solo {len(df)} meses; se esperaban más de {MINIMO_FILAS_IGP}.")
+    if df["anio"].iloc[0] != 1950 or df["mes"].iloc[0] != 1:
+        raise ValueError("La serie no empieza en enero de 1950.")
+    if not df["mes"].between(1, 12).all():
+        raise ValueError("Hay meses fuera de 1-12.")
+    if df.duplicated(["anio", "mes"]).any():
+        raise ValueError("Hay meses repetidos.")
+    indice = df["anio"] * 12 + df["mes"]
+    if not (indice.diff().dropna() == 1).all():
+        raise ValueError("La serie tiene huecos o está desordenada.")
+    fuera = df[~df["icen"].between(*RANGO_VALIDO)]
+    if not fuera.empty:
+        raise ValueError(f"Valores fuera de rango:\n{fuera.to_string(index=False)}")
+
+    for (a, m), oficial in CONTROL_OFICIAL.items():
+        fila = df[(df.anio == a) & (df.mes == m)]
+        if not fila.empty and abs(fila["icen"].iloc[0] - oficial) > 0.05:
+            raise ValueError(f"ICEN {a}-{m:02d} = {fila['icen'].iloc[0]} no coincide "
+                             f"con el oficial {oficial}.")
+    return df
 
 
-def categoria(icen):
-    if pd.isna(icen):
+# ----------------------------------------------------------------------------
+# 3. Valores manuales
+# ----------------------------------------------------------------------------
+def leer_manual(ruta: Path) -> pd.DataFrame:
+    vacio = pd.DataFrame({"anio": pd.Series(dtype="int64"), "mes": pd.Series(dtype="int64"),
+                          "icen": pd.Series(dtype="float64"), "nota": pd.Series(dtype="object")})
+    if not ruta.exists():
+        return vacio
+    df = pd.read_csv(ruta, comment="#", skip_blank_lines=True)
+    if df.empty:
+        return vacio
+    faltan = {"anio", "mes", "icen"} - set(df.columns)
+    if faltan:
+        raise ValueError(f"{ruta.name}: faltan las columnas {sorted(faltan)}.")
+    if "nota" not in df.columns:
+        df["nota"] = ""
+    df = df.dropna(subset=["anio", "mes", "icen"])
+    df["anio"] = df["anio"].astype(int)
+    df["mes"] = df["mes"].astype(int)
+    df["icen"] = df["icen"].astype(float)
+    df["nota"] = df["nota"].fillna("").astype(str)
+    if not df["mes"].between(1, 12).all() or not df["icen"].between(*RANGO_VALIDO).all():
+        raise ValueError(f"{ruta.name}: hay un mes o un valor fuera de rango.")
+    if df.duplicated(["anio", "mes"]).any():
+        raise ValueError(f"{ruta.name}: hay meses repetidos.")
+    return df[["anio", "mes", "icen", "nota"]]
+
+
+# ----------------------------------------------------------------------------
+# 4. Combinación y clasificación
+# ----------------------------------------------------------------------------
+def clasificar(v) -> str | None:
+    if pd.isna(v):
         return None
-    if icen < UMBRAL_FRIA:
+    if v < UMBRAL_NEUTRA_FRIA:
         return "Fría"
-    if icen <= UMBRAL_DEBIL:
+    if v <= UMBRAL_DEBIL:
         return "Neutra"
-    if icen <= UMBRAL_MODERADA:
+    if v <= UMBRAL_MODERADA:
         return "Cálida débil"
-    if icen <= UMBRAL_FUERTE:
+    if v <= UMBRAL_FUERTE:
         return "Cálida moderada"
-    if UMBRAL_EXTRAORDINARIA is not None and icen > UMBRAL_EXTRAORDINARIA:
-        return "Cálida extraordinaria"
-    return "Cálida fuerte"
+    if UMBRAL_EXTRAORDINARIA is None or v <= UMBRAL_EXTRAORDINARIA:
+        return "Cálida fuerte"
+    return "Cálida extraordinaria"
 
 
-def calcular_icen(df):
-    df = df.copy()
-    # Media móvil CENTRADA: el ICEN de mayo usa abril, mayo y junio
-    df["icen"] = df["anom_nino12"].rolling(3, center=True, min_periods=3).mean().round(2)
-    df["categoria"] = df["icen"].apply(categoria)
-    # ERSSTv5 puede revisar los 2 últimos meses: se marcan como provisionales
-    ultimo = df["icen"].last_valid_index()
-    df["provisional"] = False
-    if ultimo is not None:
-        df.loc[df.index >= ultimo - 1, "provisional"] = True
-    df["anio"] = df.index.year
-    df["mes"] = df.index.month
-    df["fuente"] = "NOAA CPC ERSSTv5 (calculado)"
-    df["actualizado_en"] = datetime.now(timezone.utc)
-    return df.reset_index(drop=True)[["anio", "mes", "anom_nino12", "icen", "categoria",
-                                       "provisional", "anom_nino34", "fuente", "actualizado_en"]]
+def combinar(igp: pd.DataFrame | None, manual: pd.DataFrame,
+             existente: pd.DataFrame | None) -> pd.DataFrame:
+    """Prioridad del ICEN: IGP > manual > valor que ya estaba en la tabla."""
+    partes = [d[["anio", "mes"]] for d in (igp, manual, existente)
+              if d is not None and not d.empty]
+    if not partes:
+        raise ValueError("No hay ningún dato de ICEN (ni IGP, ni manual, ni tabla previa).")
+    meses = pd.concat(partes).drop_duplicates()
+    ini = int(meses.assign(i=meses.anio * 12 + meses.mes - 1)["i"].min())
+    fin = int(meses.assign(i=meses.anio * 12 + meses.mes - 1)["i"].max())
+    base = pd.DataFrame({"i": range(ini, fin + 1)})
+    base["anio"] = base["i"] // 12
+    base["mes"] = base["i"] % 12 + 1
+    base = base.drop(columns="i")
+
+    if existente is not None and not existente.empty:
+        prev = existente[["anio", "mes", "anom_nino12", "anom_nino34", "icen", "fuente"]]
+        prev = prev.rename(columns={"icen": "icen_prev", "fuente": "fuente_prev"})
+        base = base.merge(prev, on=["anio", "mes"], how="left")
+    else:
+        base[["anom_nino12", "anom_nino34", "icen_prev"]] = float("nan")
+        base["fuente_prev"] = None
+
+    if igp is not None:
+        base = base.merge(igp.rename(columns={"icen": "icen_igp"}), on=["anio", "mes"], how="left")
+    else:
+        base["icen_igp"] = float("nan")
+    base = base.merge(manual.rename(columns={"icen": "icen_man"}), on=["anio", "mes"], how="left")
+    for c in ("icen_igp", "icen_man", "icen_prev", "anom_nino12", "anom_nino34"):
+        base[c] = pd.to_numeric(base[c], errors="coerce").astype("float64")
+    base["nota"] = base["nota"].fillna("").astype(str)
+
+    base["icen"] = base["icen_igp"]
+    base["fuente"] = FUENTE_IGP
+    base.loc[base["icen_igp"].isna(), "fuente"] = None
+
+    usar_man = base["icen"].isna() & base["icen_man"].notna()
+    base.loc[usar_man, "icen"] = base.loc[usar_man, "icen_man"]
+    base.loc[usar_man, "fuente"] = (FUENTE_MANUAL + ": " + base.loc[usar_man, "nota"]).str.rstrip(": ")
+
+    usar_prev = base["icen"].isna() & base["icen_prev"].notna()
+    base.loc[usar_prev, "icen"] = base.loc[usar_prev, "icen_prev"]
+    base.loc[usar_prev, "fuente"] = base.loc[usar_prev, "fuente_prev"]
+
+    # Si un mes nuevo no tiene ningún valor, igual queda la fila (con nulos)
+    base["fuente"] = base["fuente"].fillna("Sin ICEN")
+
+    base["categoria"] = base["icen"].map(clasificar)
+
+    # Provisionales: los últimos meses con ICEN y todo lo cargado a mano
+    con_icen = base.index[base["icen"].notna()]
+    base["provisional"] = False
+    base.loc[con_icen[-MESES_PROVISIONALES:], "provisional"] = True
+    base.loc[usar_man, "provisional"] = True
+
+    base["icen"] = base["icen"].round(2)
+    base["actualizado_en"] = pd.Timestamp.now(tz="UTC")
+    return base[COLUMNAS].reset_index(drop=True)
 
 
-def validar(df):
-    ok = True
-    for (anio, mes), oficial in REFERENCIAS_OFICIALES.items():
-        fila = df[(df.anio == anio) & (df.mes == mes)]
-        calc = fila["icen"].iloc[0] if len(fila) else np.nan
-        dif = abs(calc - oficial)
-        estado = "OK" if dif <= TOLERANCIA else "REVISAR"
-        ok &= estado == "OK"
-        print(f"  {anio}-{mes:02d}: calculado {calc:+.2f} | oficial {oficial:+.2f} | dif {dif:.2f} -> {estado}")
-    return ok
-
-
-def cliente_bigquery(proyecto):
+# ----------------------------------------------------------------------------
+# 5. BigQuery
+# ----------------------------------------------------------------------------
+def cliente_y_tabla():
     from google.cloud import bigquery
-    clave = os.getenv("GCP_SA_KEY")
-    if clave:  # GitHub Actions: el JSON completo viene en un secret
-        from google.oauth2 import service_account
-        cred = service_account.Credentials.from_service_account_info(json.loads(clave))
-        return bigquery.Client(project=proyecto, credentials=cred)
-    return bigquery.Client(project=proyecto)  # tu PC: usa GOOGLE_APPLICATION_CREDENTIALS
+    from google.oauth2 import service_account
+
+    clave = os.environ.get("GCP_SA_KEY")
+    if clave:
+        info = json.loads(clave)
+        cred = service_account.Credentials.from_service_account_info(info)
+        proyecto = os.environ.get("BQ_PROYECTO") or info.get("project_id")
+        cliente = bigquery.Client(project=proyecto, credentials=cred)
+    else:  # GOOGLE_APPLICATION_CREDENTIALS
+        proyecto = os.environ.get("BQ_PROYECTO")
+        cliente = bigquery.Client(project=proyecto)
+
+    dataset = os.environ.get("BQ_DATASET") or "monitoreo_nino"
+    tabla = os.environ.get("BQ_TABLA_ICEN") or "icen"
+    if "." not in dataset:
+        dataset = f"{cliente.project}.{dataset}"
+    return cliente, f"{dataset}.{tabla}"
 
 
-def destino_bigquery(proyecto):
-    """Arma la ruta de la tabla a partir de variables de entorno.
-    BQ_DATASET acepta 'dataset' (mismo proyecto) o 'otro_proyecto.dataset'."""
-    ds = os.getenv("BQ_DATASET") or "monitoreo_nino"
-    ref_dataset = ds if "." in ds else f"{proyecto}.{ds}"
-    tabla = os.getenv("BQ_TABLA_ICEN") or "icen"
-    return ref_dataset, f"{ref_dataset}.{tabla}"
-
-
-def verificar_dataset(cliente, ref_dataset):
-    """Comprueba que el dataset exista y, si no, muestra qué datasets hay en ese proyecto."""
+def leer_existente(cliente, tabla_id) -> pd.DataFrame | None:
     from google.api_core.exceptions import NotFound
     try:
-        return cliente.get_dataset(ref_dataset)
+        tabla = cliente.get_table(tabla_id)
     except NotFound:
-        proyecto_ds, nombre = ref_dataset.split(".", 1)
-        existentes = [d.dataset_id for d in cliente.list_datasets(proyecto_ds)]
-        print(f"\nERROR: no existe el dataset '{nombre}' en el proyecto indicado.")
-        print(f"Datasets que SÍ existen en ese proyecto: {existentes or 'ninguno'}")
-        print("Revisa BQ_PROYECTO (ID, no nombre) y la variable BQ_DATASET.")
-        sys.exit(1)
+        return None
+    columnas = {c.name for c in tabla.schema}
+    if columnas != set(COLUMNAS):
+        raise RuntimeError(f"La tabla {tabla_id} existe con otras columnas {sorted(columnas)}. "
+                           "No se escribe nada para no dañar datos ajenos.")
+    return cliente.list_rows(tabla).to_dataframe()
 
 
-def verificar_tabla_ajena(cliente, tabla, esquema):
-    """Protección: no sobrescribir una tabla existente que tenga otra estructura
-    (por ejemplo, una tabla creada por otra persona con el mismo nombre)."""
-    from google.api_core.exceptions import NotFound
-    try:
-        existente = cliente.get_table(tabla)
-    except NotFound:
-        return  # no existe: se creará
-    esperadas = {c.name for c in esquema}
-    actuales = {c.name for c in existente.schema}
-    if actuales != esperadas:
-        print(f"\nERROR: la tabla '{tabla}' ya existe con otra estructura y NO se sobrescribirá.")
-        print(f"Columnas actuales: {sorted(actuales)}")
-        print("Usa otro nombre de tabla en la variable BQ_TABLA_ICEN.")
-        sys.exit(1)
-
-
-def guardar(df):
-    df = df.dropna(subset=["anom_nino12"]).copy()
-    proyecto = os.getenv("BQ_PROYECTO")
-    if not proyecto:
-        with sqlite3.connect("datos_nino.db") as con:
-            df.to_sql("icen", con, if_exists="replace", index=False)
-        return "SQLite local 'datos_nino.db'"
-
+def guardar(cliente, tabla_id, df: pd.DataFrame) -> str:
     from google.cloud import bigquery
-    ref_dataset, tabla = destino_bigquery(proyecto)
     esquema = [
-        bigquery.SchemaField("anio", "INT64"), bigquery.SchemaField("mes", "INT64"),
-        bigquery.SchemaField("anom_nino12", "FLOAT64"), bigquery.SchemaField("icen", "FLOAT64"),
-        bigquery.SchemaField("categoria", "STRING"), bigquery.SchemaField("provisional", "BOOL"),
-        bigquery.SchemaField("anom_nino34", "FLOAT64"), bigquery.SchemaField("fuente", "STRING"),
+        bigquery.SchemaField("anio", "INTEGER"),
+        bigquery.SchemaField("mes", "INTEGER"),
+        bigquery.SchemaField("anom_nino12", "FLOAT"),
+        bigquery.SchemaField("icen", "FLOAT"),
+        bigquery.SchemaField("categoria", "STRING"),
+        bigquery.SchemaField("provisional", "BOOLEAN"),
+        bigquery.SchemaField("anom_nino34", "FLOAT"),
+        bigquery.SchemaField("fuente", "STRING"),
         bigquery.SchemaField("actualizado_en", "TIMESTAMP"),
     ]
-    cliente = cliente_bigquery(proyecto)
-    dataset = verificar_dataset(cliente, ref_dataset)
-    verificar_tabla_ajena(cliente, tabla, esquema)
-    # WRITE_TRUNCATE reemplaza la tabla completa: absorbe las revisiones de NOAA sin duplicar filas
     config = bigquery.LoadJobConfig(schema=esquema, write_disposition="WRITE_TRUNCATE")
-    # La carga se ejecuta en la misma ubicación del dataset (US, southamerica-west1, etc.)
-    cliente.load_table_from_dataframe(df, tabla, job_config=config,
-                                      location=dataset.location).result()
-    return f"BigQuery {tabla} ({cliente.get_table(tabla).num_rows} filas)"
+    cliente.load_table_from_dataframe(df, tabla_id, job_config=config).result()
+    return f"BigQuery {tabla_id} ({len(df)} filas)"
+
+
+# ----------------------------------------------------------------------------
+# Programa principal
+# ----------------------------------------------------------------------------
+def resumen(df: pd.DataFrame, n: int = 6) -> str:
+    return df.dropna(subset=["icen"]).tail(n)[
+        ["anio", "mes", "icen", "categoria", "provisional", "fuente"]].to_string(index=False)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--validar", action="store_true", help="muestra controles adicionales")
+    ap.add_argument("--no-guardar", action="store_true", help="no escribe en BigQuery")
+    args = ap.parse_args()
+
+    print(f"1) Descargando {URL_IGP}")
+    texto = descargar(URL_IGP)
+    igp = None
+    aviso = None
+    if texto is None:
+        aviso = "No se pudo descargar el archivo del IGP; se conserva el ICEN previo."
+        print(f"   AVISO: {aviso}")
+    else:
+        igp = parsear_igp(texto)  # si el formato cambió, falla aquí sin escribir nada
+        u = igp.iloc[-1]
+        print(f"   OK: {len(igp)} meses, último {int(u.anio)}-{int(u.mes):02d} = {u.icen:+.2f}")
+
+    print(f"2) Valores manuales: {RUTA_MANUAL.name}")
+    manual = leer_manual(RUTA_MANUAL)
+    print(f"   {len(manual)} fila(s)")
+
+    cliente = tabla_id = None
+    existente = None
+    if not args.no_guardar:
+        cliente, tabla_id = cliente_y_tabla()
+        print(f"3) Leyendo tabla actual {tabla_id}")
+        existente = leer_existente(cliente, tabla_id)
+        print(f"   {0 if existente is None else len(existente)} filas previas")
+
+    final = combinar(igp, manual, existente)
+
+    if args.validar and existente is not None and igp is not None:
+        comp = existente.merge(igp, on=["anio", "mes"], suffixes=("_prev", "_igp"))
+        comp = comp.dropna(subset=["icen_prev"])
+        if not comp.empty:
+            dif = (comp["icen_prev"] - comp["icen_igp"]).abs()
+            print(f"   Control vs. cálculo anterior (NOAA v5): {len(comp)} meses, "
+                  f"diferencia media {dif.mean():.3f} °C, máxima {dif.max():.2f} °C")
+
+    # Protección: nunca guardar menos meses con ICEN que los que ya había
+    if existente is not None:
+        antes = existente["icen"].notna().sum()
+        ahora = final["icen"].notna().sum()
+        if ahora < antes:
+            print(f"ERROR: la nueva serie tiene {ahora} meses con ICEN y la tabla {antes}. "
+                  "No se escribe nada.")
+            return 1
+
+    print("4) Últimos meses:")
+    print(resumen(final))
+
+    if args.no_guardar:
+        print("Modo --no-guardar: no se escribió en BigQuery.")
+    else:
+        print("Guardado en:", guardar(cliente, tabla_id, final))
+
+    if aviso:
+        print(f"AVISO: {aviso}")
+    return 0
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--archivo", help="leer un archivo local en vez de descargar")
-    ap.add_argument("--validar", action="store_true")
-    ap.add_argument("--sin-guardar", action="store_true")
-    a = ap.parse_args()
-
-    texto = open(a.archivo, encoding="utf-8").read() if a.archivo else descargar()
-    datos = calcular_icen(parsear(texto))
-    print(datos.dropna(subset=["anom_nino12"]).tail(8).drop(columns=["fuente", "actualizado_en"])
-          .to_string(index=False))
-    if a.validar:
-        print("\nValidación contra valores oficiales ENFEN:")
-        if not validar(datos):
-            sys.exit(1)
-    if not a.sin_guardar:
-        print(f"\nGuardado en: {guardar(datos)}")
+    sys.exit(main())
