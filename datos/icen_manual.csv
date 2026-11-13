@@ -1,0 +1,6 @@
+# ICEN cargado a mano. Solo se usa para meses que el archivo del IGP todavia NO trae.
+# Cuando el IGP publique ese mes, su valor reemplaza automaticamente al manual.
+# Fuente sugerida: comunicado oficial del ENFEN o la pagina SIOFEN de IMARPE.
+# Formato: una fila por mes, punto decimal. Ejemplo (sin el # inicial):
+# 2026,10,4.80,Comunicado ENFEN N°xx-2026
+anio,mes,icen,nota
