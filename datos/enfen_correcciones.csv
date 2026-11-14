@@ -1,0 +1,6 @@
+# Correcciones de lo leído automáticamente en los comunicados del ENFEN.
+# Úsalo solo si la tabla marca revisar = true o un valor quedó mal leído.
+# campo: fecha | estado_alerta | titular | magnitud_nino12 | horizonte_nino12 | magnitud_nino34 | horizonte_nino34 | proximo_comunicado
+# Las fechas se escriben AAAA-MM-DD. Ejemplo (sin el # inicial):
+# 20-2026,horizonte_nino12,hasta febrero de 2027
+comunicado,campo,valor

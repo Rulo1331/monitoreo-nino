@@ -1,0 +1,8 @@
+# Probabilidades del comunicado oficial del ENFEN (vienen en una figura, por eso se cargan a mano).
+# Una fila por comunicado, región, periodo y magnitud. Probabilidad en %, sin el signo.
+# region: Niño 1+2 | Niño 3.4
+# magnitud: Neutra | Débil | Moderada | Fuerte | Muy fuerte | Extraordinaria | Fría débil | Fría moderada | Fría fuerte
+# periodo: como lo escribe el comunicado (ejemplo: Set 2026 - Ene 2027, o Dic 2026)
+comunicado,region,periodo,magnitud,probabilidad,nota
+15-2026,Niño 1+2,Set 2026 - Ene 2027,Extraordinaria,62,Magnitud más probable (fuente: comunicado N° 15-2026)
+15-2026,Niño 3.4,Set 2026 - Ene 2027,Muy fuerte,58,Magnitud más probable (fuente: comunicado N° 15-2026)
