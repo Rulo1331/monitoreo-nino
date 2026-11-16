@@ -31,8 +31,6 @@ Variables de entorno (las mismas de antes):
 """
 
 import argparse
-import datetime as dt
-import io
 import json
 import os
 import sys
@@ -51,14 +49,17 @@ RUTA_MANUAL = Path(__file__).resolve().parent.parent / "datos" / "icen_manual.cs
 FUENTE_IGP = "IGP/ENFEN ICEN.txt (oficial)"
 FUENTE_MANUAL = "Manual"
 
-# Umbrales ENFEN para condiciones cálidas (°C).
-# UMBRAL_EXTRAORDINARIA = 3.0 es provisional: confirmarlo en la Nota Técnica
-# ENFEN 01-2024. Si encuentras el valor exacto, cambia solo este número.
+# Umbrales ENFEN de magnitud según el ICEN (°C), tomados de la leyenda oficial de la Figura 2
+# del Comunicado Oficial ENFEN N° 20-2026 (Nota Técnica ENFEN 01-2024):
+#   Fría fuerte < -1.3 | Fría moderada -1.3 a -1.1 | Fría débil -1.1 a -0.7 | Neutra -0.7 a 0.5
+#   Cálida débil 0.5 a 1.3 | Cálida moderada 1.3 a 2.1 | Cálida fuerte 2.1 a 3.5 | Cálida extraordinaria > 3.5
+UMBRAL_FRIA_FUERTE = -1.3
+UMBRAL_FRIA_MODERADA = -1.1
 UMBRAL_NEUTRA_FRIA = -0.7
 UMBRAL_DEBIL = 0.5
 UMBRAL_MODERADA = 1.3
 UMBRAL_FUERTE = 2.1
-UMBRAL_EXTRAORDINARIA = 3.0
+UMBRAL_EXTRAORDINARIA = 3.5
 
 MESES_PROVISIONALES = 2      # últimos meses que aún pueden corregirse
 MINIMO_FILAS_IGP = 900       # desde 1950 deben ser > 900 meses
@@ -174,8 +175,12 @@ def leer_manual(ruta: Path) -> pd.DataFrame:
 def clasificar(v) -> str | None:
     if pd.isna(v):
         return None
+    if v < UMBRAL_FRIA_FUERTE:
+        return "Fría fuerte"
+    if v < UMBRAL_FRIA_MODERADA:
+        return "Fría moderada"
     if v < UMBRAL_NEUTRA_FRIA:
-        return "Fría"
+        return "Fría débil"
     if v <= UMBRAL_DEBIL:
         return "Neutra"
     if v <= UMBRAL_MODERADA:
