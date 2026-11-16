@@ -1,54 +1,50 @@
 """
-Recolector: postura oficial del ENFEN (comunicados oficiales).
+Recolector: postura oficial del ENFEN (comunicados oficiales), carga desde una carpeta.
 
-Fuente: https://enfen.imarpe.gob.pe/ (la portada lista los últimos comunicados en PDF).
+La web del ENFEN no es accesible desde los servidores de GitHub, y los comunicados salen cada
+~15 días, así que el flujo es manual y simple:
+
+  1. Descargas el PDF del comunicado desde https://enfen.imarpe.gob.pe/
+  2. Lo subes a la carpeta datos/comunicados_enfen/ del repositorio (GitHub → Add file → Upload files)
+  3. El workflow "ENFEN comunicados" se ejecuta solo, lee TODOS los PDF de la carpeta y reemplaza
+     la tabla enfen_comunicados.
 
 Qué guarda:
-  1. enfen_comunicados (automático): una fila por comunicado con número, fecha, estado del
-     sistema de alerta, titular, magnitud esperada y horizonte para Niño 1+2 (El Niño costero)
-     y Niño 3.4 (Pacífico central), fecha del próximo comunicado y el texto completo del PDF.
-     La tabla ACUMULA: los comunicados que ya no aparecen en la portada se conservan.
-  2. enfen_probabilidades (manual): las probabilidades por magnitud vienen en una FIGURA del
-     comunicado, no en el texto, así que se cargan a mano en datos/enfen_probabilidades.csv.
+  - enfen_comunicados: una fila por PDF con número, fecha, estado del sistema de alerta, titular,
+    magnitud y horizonte para Niño 1+2 y Niño 3.4, próximo comunicado, enlace al PDF en GitHub
+    y el texto completo.
+  - enfen_probabilidades: las probabilidades vienen en una FIGURA del comunicado, así que se
+    cargan a mano en datos/enfen_probabilidades.csv.
 
-Correcciones: si el texto de un comunicado viene redactado de otra forma y algún campo queda
-vacío o mal leído, se corrige en datos/enfen_correcciones.csv (no hace falta tocar el código).
-La columna `revisar` = true marca los comunicados con algún campo clave sin leer.
-
-Si la web del ENFEN no responde, no borra nada: conserva la tabla, carga los CSV y termina
-con un AVISO (código 0).
+El número del comunicado se toma del texto del PDF ("N° 20-2026"); si no aparece, del nombre
+del archivo. Si un dato queda vacío o mal leído (revisar = true), se corrige en
+datos/enfen_correcciones.csv.
 
 Uso:
     python recolectores/enfen.py --validar
-    python recolectores/enfen.py --reprocesar          # vuelve a leer los PDF de la portada
-    python recolectores/enfen.py --pdf prueba.pdf --sin-guardar   # prueba con un PDF local
+    python recolectores/enfen.py --carpeta otra/carpeta --sin-guardar     # prueba local
 """
 import argparse
-import html
 import io
 import json
 import os
 import re
 import sqlite3
 import sys
-import time
 from datetime import date, datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
-import requests
 
-PORTADA = "https://enfen.imarpe.gob.pe/"
-LISTADO = "https://enfen.imarpe.gob.pe/comunicados/"
 RAIZ = Path(__file__).resolve().parent.parent
+CARPETA = RAIZ / "datos" / "comunicados_enfen"
 CSV_PROB = RAIZ / "datos" / "enfen_probabilidades.csv"
 CSV_CORR = RAIZ / "datos" / "enfen_correcciones.csv"
-FUENTE = "ENFEN, comunicado oficial (PDF)"
-CABECERAS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) monitoreo-nino/1.0 (uso interno)",
-             "Accept-Language": "es-PE,es;q=0.9"}
+FUENTE = "ENFEN, comunicado oficial (PDF cargado al repositorio)"
+NUMERO_TEXTO = re.compile(r"comunicado\s+oficial\s+(?:enfen\s+)?n\s*[°º.o]*\s*(\d{1,2})\s*[-–]\s*(\d{4})", re.I)
+NUMERO_ARCHIVO = re.compile(r"(?<!\d)(\d{1,2})\s*[-_ ]\s*(20\d{2})(?!\d)")
 
-ENLACE = re.compile(r'href="(https://enfen\.imarpe\.gob\.pe/download/'
-                    r'comunicado-oficial-enfen-n-?(\d{1,2})-(\d{4})[^"]*)"', re.I)
 MESES = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6, "julio": 7,
          "agosto": 8, "setiembre": 9, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12}
 MES_RE = "|".join(MESES)
@@ -67,40 +63,6 @@ MAGNITUDES_PROB = {"Neutra", "Débil", "Moderada", "Fuerte", "Muy fuerte", "Extr
                    "Fría débil", "Fría moderada", "Fría fuerte"}
 CAMPOS_CORREGIBLES = {"fecha", "estado_alerta", "titular", "magnitud_nino12", "horizonte_nino12",
                       "magnitud_nino34", "horizonte_nino34", "proximo_comunicado"}
-
-
-# ---------------------------------------------------------------- descarga
-def pedir(url, binario=False, intentos=3):
-    for i in range(1, intentos + 1):
-        try:
-            r = requests.get(url, headers=CABECERAS, timeout=90)
-            r.raise_for_status()
-            return r.content if binario else r.text
-        except requests.RequestException as e:
-            print(f"   Intento {i}/{intentos} falló ({url[:70]}...): {e}")
-            if i < intentos:
-                time.sleep(15 * i)
-    return None
-
-
-def listar_comunicados():
-    """Devuelve {"20-2026": url_pdf, ...} con los comunicados enlazados en la portada y el listado."""
-    encontrados = {}
-    for pagina in (PORTADA, LISTADO):
-        texto = pedir(pagina)
-        if texto is None:
-            continue
-        for url, nro, anio in ENLACE.findall(texto):
-            encontrados.setdefault(f"{int(nro)}-{anio}", html.unescape(url))
-    return encontrados
-
-
-def texto_pdf(contenido):
-    from pypdf import PdfReader
-    if not contenido.startswith(b"%PDF"):
-        raise ValueError("La descarga no es un PDF (¿la web devolvió una página en su lugar?).")
-    lector = PdfReader(io.BytesIO(contenido))
-    return "\n".join((p.extract_text() or "") for p in lector.pages)
 
 
 # ---------------------------------------------------------------- lectura del texto
@@ -248,7 +210,7 @@ def marcar_revision(df):
 ESQUEMA_COM = [("comunicado", "STRING"), ("anio", "INT64"), ("numero", "INT64"), ("fecha", "DATE"),
                ("estado_alerta", "STRING"), ("titular", "STRING"), ("magnitud_nino12", "STRING"),
                ("horizonte_nino12", "STRING"), ("magnitud_nino34", "STRING"), ("horizonte_nino34", "STRING"),
-               ("proximo_comunicado", "DATE"), ("revisar", "BOOL"), ("url", "STRING"), ("texto", "STRING"),
+               ("proximo_comunicado", "DATE"), ("revisar", "BOOL"), ("archivo", "STRING"), ("url", "STRING"), ("texto", "STRING"),
                ("fuente", "STRING"), ("actualizado_en", "TIMESTAMP")]
 ESQUEMA_PROB = [("comunicado", "STRING"), ("region", "STRING"), ("periodo", "STRING"), ("magnitud", "STRING"),
                 ("probabilidad", "FLOAT64"), ("nota", "STRING"), ("fuente", "STRING"), ("actualizado_en", "TIMESTAMP")]
@@ -312,74 +274,89 @@ def guardar(cliente, ds, nombre, df, esquema):
     return f"BigQuery {ds}.{nombre} ({len(df)} filas)"
 
 
-# ---------------------------------------------------------------- programa principal
-def procesar(comunicado, url, contenido=None):
-    contenido = contenido if contenido is not None else pedir(url, binario=True)
-    if contenido is None:
+# ---------------------------------------------------------------- lectura de la carpeta
+def texto_pdf(contenido):
+    from pypdf import PdfReader
+    if not contenido.startswith(b"%PDF"):
+        raise ValueError("el archivo no es un PDF")
+    lector = PdfReader(io.BytesIO(contenido))
+    return "\n".join((p.extract_text() or "") for p in lector.pages)
+
+
+def numero_de(texto, nombre):
+    m = NUMERO_TEXTO.search(re.sub(r"\s+", " ", texto[:3000])) or NUMERO_ARCHIVO.search(nombre)
+    return f"{int(m.group(1))}-{m.group(2)}" if m else None
+
+
+def enlace_github(nombre):
+    """Enlace para abrir el PDF desde el dashboard (solo dentro de GitHub Actions)."""
+    repo = os.getenv("GITHUB_REPOSITORY")
+    if not repo:
         return None
-    texto = texto_pdf(contenido)
-    if len(texto.strip()) < 200:
-        raise ValueError(f"El PDF del comunicado {comunicado} no tiene texto legible (¿es una imagen escaneada?).")
-    fila = leer_comunicado(texto, comunicado)
-    fila.update(url=url, texto=re.sub(r"[ \t]+", " ", texto).strip(), fuente=FUENTE,
-                actualizado_en=datetime.now(timezone.utc))
-    return fila
+    servidor = os.getenv("GITHUB_SERVER_URL", "https://github.com")
+    rama = os.getenv("GITHUB_REF_NAME", "main")
+    return f"{servidor}/{repo}/blob/{rama}/datos/comunicados_enfen/{quote(nombre)}"
 
 
+def leer_carpeta(carpeta):
+    filas, errores = [], []
+    archivos = sorted(p for p in carpeta.glob("*") if p.suffix.lower() == ".pdf")
+    print(f"1) PDF en {carpeta.relative_to(RAIZ) if carpeta.is_relative_to(RAIZ) else carpeta}: {len(archivos)}")
+    for ruta in archivos:
+        try:
+            texto = texto_pdf(ruta.read_bytes())
+        except Exception as e:
+            errores.append(f"{ruta.name}: no se pudo leer ({e})")
+            continue
+        comunicado = numero_de(texto, ruta.name)
+        if comunicado is None:
+            errores.append(f"{ruta.name}: no se encontró el número ni en el texto ni en el nombre "
+                           f"(renómbralo, por ejemplo, Comunicado-20-2026.pdf)")
+            continue
+        if len(texto.strip()) < 200:      # PDF escaneado: se registra igual, para corregirlo a mano
+            print(f"   AVISO: {ruta.name} casi no tiene texto (¿es una imagen?); completa sus datos en {CSV_CORR.name}")
+            texto = ""
+        fila = leer_comunicado(texto, comunicado)
+        fila.update(archivo=ruta.name, url=enlace_github(ruta.name), texto=re.sub(r"[ \t]+", " ", texto).strip(),
+                    fuente=FUENTE, actualizado_en=datetime.now(timezone.utc))
+        filas.append(fila)
+    df = pd.DataFrame(filas, columns=[n for n, _ in ESQUEMA_COM if n != "revisar"])
+    repetidos = df[df.duplicated("comunicado", keep=False)]
+    if not repetidos.empty:
+        errores.append("comunicados repetidos: " + ", ".join(f"{r.comunicado} ({r.archivo})" for r in repetidos.itertuples()))
+        df = df.drop_duplicates("comunicado", keep="last")
+    return df, errores
+
+
+# ---------------------------------------------------------------- programa principal
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--validar", action="store_true")
-    ap.add_argument("--reprocesar", action="store_true", help="vuelve a leer todos los PDF de la portada")
-    ap.add_argument("--pdf", help="probar con un PDF local (se trata como comunicado --numero)")
-    ap.add_argument("--numero", default="99-2026")
+    ap.add_argument("--carpeta", default=str(CARPETA))
     ap.add_argument("--sin-guardar", action="store_true")
     a = ap.parse_args()
 
-    aviso = None
-    if a.pdf:
-        nuevos = [procesar(a.numero, a.pdf, open(a.pdf, "rb").read())]
-        existente = None
-        cliente = ds = None
-    else:
-        cliente, ds = destino() if not a.sin_guardar else (None, None)
-        nombre_com = os.getenv("BQ_TABLA_ENFEN") or "enfen_comunicados"
-        existente = None if a.sin_guardar else leer_existente(cliente, ds, nombre_com, ESQUEMA_COM)
-        ya = set() if existente is None or a.reprocesar else set(existente["comunicado"])
+    carpeta = Path(a.carpeta).resolve()
+    carpeta.mkdir(parents=True, exist_ok=True)
+    tabla, errores = leer_carpeta(carpeta)
+    for e in errores:
+        print(f"   ERROR: {e}")
 
-        print(f"1) Buscando comunicados en {PORTADA}")
-        enlaces = listar_comunicados()
-        if not enlaces:
-            aviso = "No se pudo leer la web del ENFEN (o no se encontraron enlaces); se conserva la tabla."
-            print(f"   AVISO: {aviso}")
-        else:
-            print(f"   Encontrados: {', '.join(sorted(enlaces, key=lambda c: (c[-4:], int(c.split('-')[0]))))}")
-        nuevos = []
-        for com, url in sorted(enlaces.items()):
-            if com in ya:
-                continue
-            print(f"2) Leyendo comunicado {com}")
-            fila = procesar(com, url)
-            if fila is None:
-                aviso = f"No se pudo descargar el PDF del comunicado {com}; se intentará en la próxima ejecución."
-                print(f"   AVISO: {aviso}")
-                continue
-            nuevos.append(fila)
-
-    nuevos_df = pd.DataFrame(nuevos, columns=[n for n, _ in ESQUEMA_COM if n != "revisar"])
-    if existente is not None and not existente.empty:
-        quedan = existente[~existente["comunicado"].isin(nuevos_df["comunicado"])]
-        tabla = pd.concat([quedan.drop(columns="revisar"), nuevos_df], ignore_index=True)
-    else:
-        tabla = nuevos_df
     if not tabla.empty:
         tabla = marcar_revision(aplicar_correcciones(tabla))
         tabla = tabla.sort_values(["anio", "numero"]).reset_index(drop=True)
-
         vista = tabla[["comunicado", "fecha", "estado_alerta", "magnitud_nino12", "horizonte_nino12",
                        "magnitud_nino34", "horizonte_nino34", "proximo_comunicado", "revisar"]]
-        print("\nComunicados (últimos 4):")
-        with pd.option_context("display.width", 250, "display.max_columns", 20):
-            print(vista.tail(4).to_string(index=False))
+        print("\n2) Comunicados leídos:")
+        with pd.option_context("display.width", 250, "display.max_columns", 20, "display.max_colwidth", 30):
+            print(vista.to_string(index=False))
+        nums = tabla.groupby("anio")["numero"].apply(set)
+        for anio, vistos in nums.items():
+            faltan = sorted(set(range(1, max(vistos) + 1)) - vistos)
+            if len(faltan) > 5:
+                print(f"   AVISO: faltan {len(faltan)} comunicados de {anio} (entre el 1 y el {max(faltan)})")
+            elif faltan:
+                print(f"   AVISO: faltan los comunicados {', '.join(f'{n}-{anio}' for n in faltan)}")
 
     error_prob = None
     try:
@@ -393,26 +370,27 @@ def main():
         pendientes = tabla[tabla["revisar"]]["comunicado"].tolist()
         if pendientes:
             print(f"AVISO: revisar {pendientes}: falta fecha, estado o magnitud de Niño 1+2. "
-                  f"Corrígelo en {CSV_CORR.name} o avísame para ajustar la lectura.")
-        sin_prob = sorted(set(tabla["comunicado"].tail(1)) - set(prob["comunicado"]))
-        if sin_prob:
-            print(f"AVISO: el último comunicado ({sin_prob[0]}) aún no tiene probabilidades en {CSV_PROB.name}.")
+                  f"Corrígelo en {CSV_CORR.name}.")
+        ultimo = tabla["comunicado"].iloc[-1]
+        if ultimo not in set(prob["comunicado"]):
+            print(f"AVISO: el último comunicado ({ultimo}) aún no tiene probabilidades en {CSV_PROB.name}.")
 
-    if a.sin_guardar or a.pdf:
+    if a.sin_guardar:
         print("\nModo de prueba: no se guardó nada.")
     else:
+        cliente, ds = destino()
+        nombre = os.getenv("BQ_TABLA_ENFEN") or "enfen_comunicados"
+        existente = leer_existente(cliente, ds, nombre, ESQUEMA_COM)
         if existente is not None and len(tabla) < len(existente):
-            print("ERROR: la tabla nueva tendría menos comunicados que la actual. No se escribe nada.")
+            print(f"ERROR: la carpeta tiene {len(tabla)} comunicados y la tabla {len(existente)}. "
+                  "¿Se borró o renombró algún PDF? No se escribe nada.")
             return 1
         if not tabla.empty:
-            print("\nGuardado en:", guardar(cliente, ds, os.getenv("BQ_TABLA_ENFEN") or "enfen_comunicados",
-                                             tabla, ESQUEMA_COM))
+            print("\nGuardado en:", guardar(cliente, ds, nombre, tabla, ESQUEMA_COM))
         if error_prob is None:
             print("Guardado en:", guardar(cliente, ds, os.getenv("BQ_TABLA_ENFEN_PROB") or "enfen_probabilidades",
                                            prob, ESQUEMA_PROB))
-    if aviso:
-        print(f"AVISO: {aviso}")
-    return 1 if error_prob else 0
+    return 1 if (errores or error_prob) else 0
 
 
 if __name__ == "__main__":
