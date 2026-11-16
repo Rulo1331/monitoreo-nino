@@ -1,0 +1,37 @@
+# Ubicación en el repositorio: .github/workflows/enfen.yml
+# Carga los comunicados del ENFEN a BigQuery. No corre a diario: se ejecuta solo cuando
+# subes o cambias un PDF en datos/comunicados_enfen/ o editas los CSV del ENFEN.
+name: ENFEN comunicados
+
+on:
+  push:
+    paths:
+      - "datos/comunicados_enfen/**"
+      - "datos/enfen_probabilidades.csv"
+      - "datos/enfen_correcciones.csv"
+      - "recolectores/enfen.py"
+  workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
+
+concurrency:                # si subes varios PDF seguidos, solo corre la última versión
+  group: enfen
+  cancel-in-progress: true
+
+jobs:
+  enfen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUNBUFFERED: "1"
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      BQ_PROYECTO: ${{ secrets.BQ_PROYECTO }}
+      BQ_DATASET: ${{ vars.BQ_DATASET || 'monitoreo_nino' }}
+      BQ_TABLA_ENFEN: ${{ vars.BQ_TABLA_ENFEN || 'enfen_comunicados' }}
+      BQ_TABLA_ENFEN_PROB: ${{ vars.BQ_TABLA_ENFEN_PROB || 'enfen_probabilidades' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install requests pandas pypdf "google-cloud-bigquery[pandas]"
+      - name: Leer comunicados y cargarlos a BigQuery
+        run: python recolectores/enfen.py --validar
