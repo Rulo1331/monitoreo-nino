@@ -31,8 +31,6 @@ jobs:
       BQ_TABLA_LLUVIA_SAT: ${{ vars.BQ_TABLA_LLUVIA_SAT || 'lluvia_satelite' }}
       BQ_TABLA_LLUVIA_CONTRASTE: ${{ vars.BQ_TABLA_LLUVIA_CONTRASTE || 'lluvia_contraste' }}
       BQ_TABLA_EVENTOS_SAT: ${{ vars.BQ_TABLA_EVENTOS_SAT || 'eventos_satelite' }}
-      BQ_TABLA_ENFEN: ${{ vars.BQ_TABLA_ENFEN || 'enfen_comunicados' }}
-      BQ_TABLA_ENFEN_PROB: ${{ vars.BQ_TABLA_ENFEN_PROB || 'enfen_probabilidades' }}
       BQ_TABLA_CALOR: ${{ vars.BQ_TABLA_CALOR || 'calor_subsuperficial' }}
       EARTHDATA_USER: ${{ secrets.EARTHDATA_USER }}
       EARTHDATA_PASS: ${{ secrets.EARTHDATA_PASS }}
@@ -60,10 +58,7 @@ jobs:
         if: always()
         timeout-minutes: 60                  # la primera vez también procesa los eventos históricos
         run: python recolectores/lluvia_satelite.py --validar
-      - name: Postura oficial ENFEN (comunicados)
-        if: always()
-        timeout-minutes: 15
-        run: python recolectores/enfen.py --validar
+      # Los comunicados del ENFEN tienen su propio workflow (enfen.yml): se cargan al subir el PDF.
       - name: Calor bajo la superficie del Pacífico (0-300 m)
         if: always()
         run: python recolectores/calor_subsuperficial.py --validar
