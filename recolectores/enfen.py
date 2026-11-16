@@ -48,15 +48,30 @@ NUMERO_ARCHIVO = re.compile(r"(?<!\d)(\d{1,2})\s*[-_ ]\s*(20\d{2})(?!\d)")
 MESES = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6, "julio": 7,
          "agosto": 8, "setiembre": 9, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12}
 MES_RE = "|".join(MESES)
-FECHA = re.compile(rf"\b(\d{{1,2}})\s+de\s+({MES_RE})\s+(?:de|del)\s+(\d{{4}})", re.I)
-# "muy fuerte" va antes que "fuerte" para que gane la coincidencia más larga
-MAGNITUDES = ["extraordinaria", "muy fuerte", "fuerte", "moderada", "débil"]
-MAG_RE = re.compile(r"\b(" + "|".join(MAGNITUDES) + r")\b", re.I)
-ESTADO = re.compile(r"\b(no activo|(?:vigilancia|alerta)\s+de\s+(?:el\s+niño|la\s+niña)\s+coster[oa])\b", re.I)
-HORIZONTE = re.compile(rf"\bhasta\s+((?:(?:inicios|fines|mediados|finales|el\s+verano|el\s+otoño|el\s+invierno)"
-                       rf"\s+(?:de|del)\s+)?(?:(?:{MES_RE}|verano|otoño|invierno|primavera)\s+(?:de|del)\s+)?\d{{4}})", re.I)
-PROXIMO = re.compile(rf"pr[oó]ximo\s+comunicado.{{0,160}}?(\d{{1,2}})\s+de\s+({MES_RE})\s+(?:de|del)\s+(\d{{4}})",
+# Fechas como las escribe el ENFEN: "15 de enero 2026", "28 setiembre 2026", "30 de enero de 2026"
+FECHA = re.compile(rf"\b(\d{{1,2}})\s+(?:de\s+)?({MES_RE})\s+(?:de(?:l)?\s+)?(\d{{4}})", re.I)
+FIN_PALABRA = r"(?![a-záéíóúñ])"          # en vez de \b: las notas al pie se pegan ("Costero1", "fuerte3")
+ESTADO = re.compile(r"\b(no\s+activo|(?:vigilancia|alerta)\s+de\s+(?:el\s+niño|la\s+niña)\s+coster[oa])"
+                    + FIN_PALABRA, re.I)
+MAGS = r"extraordinaria|muy\s+fuerte|fuerte|moderad[ao]|débil"
+MAGNITUD = re.compile(
+    rf"magnitud(?:es)?\s+(?:(?:más\s+probables?|de|es|serían|sería|una)\s+)*(?P<entre>entre\s+)?"
+    rf"(?P<a>{MAGS})(?:e?s)?{FIN_PALABRA}\s*\d?\s*(?:\([^)]*\)\s*)?"
+    rf"(?:(?P<sep>y|o)\s+(?P<b>{MAGS}){FIN_PALABRA})?", re.I)
+HORIZONTE = re.compile(
+    rf"\bhasta\s+((?:el\s+)?(?:(?:próximo|inicios|fines|mediados|finales)\s+(?:de\s+|del\s+)?)?"
+    rf"(?:(?:el\s+)?(?:{MES_RE}|verano|otoño|invierno|primavera)(?:\s+(?:de\s+|del\s+)?(?:\d{{4}}|presente\s+año))?"
+    rf"|\d{{4}}))(?=\d?(?!\d))", re.I)
+# "de setiembre 2026 a enero de 2027": el final del rango sirve de horizonte si no hay un "hasta"
+RANGO_A = re.compile(rf"\bde\s+(?:{MES_RE})\s+(?:de\s+)?\d{{4}}\s+a\s+((?:{MES_RE})\s+(?:de\s+)?\d{{4}})", re.I)
+# "las condiciones cálidas débiles son las más probables" (sin la palabra "magnitud")
+CONDICION = re.compile(rf"condici[oó]n(?:es)?\s+cálidas?\s+(?P<a>{MAGS})(?:e?s)?{FIN_PALABRA}", re.I)
+PROXIMO = re.compile(rf"pr[oó]ximo\s+comunicado.{{0,160}}?(\d{{1,2}})\s+de\s+({MES_RE})\s+(?:de\s+|del\s+)?(\d{{4}})",
                      re.I | re.S)
+# Dónde empieza el párrafo del Pacífico central y dónde termina el resumen de los océanos
+INICIO_34 = re.compile(r"Niño\s*3[.,]\s*4|Pacífico\s+(?:ecuatorial\s+)?central", re.I)
+FIN_RESUMEN = re.compile(r"precipitaci|lluvias|pronóstico\s+hidrológico|recursos\s+pesqueros|"
+                         r"ante\s+estos\s+escenarios|se\s+recomienda", re.I)
 
 REGIONES_PROB = {"Niño 1+2", "Niño 3.4"}
 MAGNITUDES_PROB = {"Neutra", "Débil", "Moderada", "Fuerte", "Muy fuerte", "Extraordinaria",
@@ -73,25 +88,47 @@ def a_fecha(d, mes, a):
         return None
 
 
-def oraciones(texto):
-    plano = re.sub(r"\s+", " ", texto)
-    return [o.strip() for o in re.split(r"(?<=[.;])\s+(?=[A-ZÁÉÍÓÚÑ(])", plano) if o.strip()]
-
-
-def region_de(oracion):
-    o = oracion.lower()
-    central = bool(re.search(r"3[.,]4|pacífico\s+(?:ecuatorial\s+)?central", o))
-    costero = bool(re.search(r"1\s*\+\s*2|coster[oa]|costa\s+peruana|frente\s+a\s+la\s+costa", o))
-    if central and not costero:
-        return "nino34"
-    if costero and not central:
-        return "nino12"
-    return None
-
-
 def capitalizar(estado):
     e = re.sub(r"\s+", " ", estado.strip().lower())
-    return e[0].upper() + e[1:].replace("el niño", "El Niño").replace("la niña", "La Niña").replace("costero", "Costero").replace("costera", "Costera")
+    e = e[0].upper() + e[1:]
+    for a, b in (("el niño", "El Niño"), ("la niña", "La Niña"), ("costero", "Costero"), ("costera", "Costera")):
+        e = e.replace(a, b)
+    return e
+
+
+def frase_magnitud(m):
+    a = re.sub(r"\s+", " ", m.group("a").lower()).replace("moderado", "moderada")
+    if m.group("b"):
+        b = re.sub(r"\s+", " ", m.group("b").lower()).replace("moderado", "moderada")
+        return f"Entre {a} y {b}" if m.group("entre") else f"{a.capitalize()} {m.group('sep').lower()} {b}"
+    return a.capitalize()
+
+
+def leer_bloque(bloque, anio):
+    """Magnitud y horizonte de un párrafo.
+    Magnitud: la primera mencionada ("magnitud ..." o, si no aparece, "condiciones cálidas ...").
+    Horizonte: el primer "hasta ..." del párrafo que no hable de la condición neutra; si no hay,
+    el final de un rango "de <mes> a <mes>"."""
+    m = MAGNITUD.search(bloque) or CONDICION.search(bloque)
+    if not m:
+        return None, None
+    magnitud = frase_magnitud(m) if "sep" in m.groupdict() else frase_magnitud_simple(m.group("a"))
+    horizonte = None
+    for h in HORIZONTE.finditer(bloque):
+        if "neutra" not in bloque[max(0, h.start() - 60):h.start()].lower():
+            horizonte = h.group(1)
+            break
+    if horizonte is None:
+        r = RANGO_A.search(bloque)
+        horizonte = r.group(1) if r else None
+    if horizonte:
+        horizonte = re.sub(r"\s+", " ", horizonte).lower().replace("del presente año", f"de {anio}")
+        horizonte = "hasta " + horizonte
+    return magnitud, horizonte
+
+
+def frase_magnitud_simple(a):
+    return re.sub(r"\s+", " ", a.lower()).replace("moderado", "moderada").capitalize()
 
 
 def leer_comunicado(texto, comunicado):
@@ -100,48 +137,49 @@ def leer_comunicado(texto, comunicado):
             "titular": None, "magnitud_nino12": None, "horizonte_nino12": None, "magnitud_nino34": None,
             "horizonte_nino34": None, "proximo_comunicado": None}
     plano = re.sub(r"\s+", " ", texto)
+    cab = NUMERO_TEXTO.search(plano)
+    pos = cab.end() if cab else 0
 
-    m = FECHA.search(plano)
+    # Fecha: la que va justo debajo del número del comunicado
+    m = FECHA.match(plano, pos) or FECHA.search(plano, pos, pos + 80) or FECHA.search(plano, pos, pos + 400)
     if m:
         fila["fecha"] = a_fecha(*m.groups())
+        pos = m.end()
 
-    tras_rotulo = re.search(r"estado\s+del?\s+sistema\s+de\s+alerta\s*:?\s*(.{0,80})", plano, re.I)
-    m = ESTADO.search(tras_rotulo.group(1)) if tras_rotulo else None
-    m = m or ESTADO.search(plano)
+    # Estado: con o sin el rótulo "Estado del sistema de alerta:", en las líneas siguientes
+    m = ESTADO.search(plano, pos, pos + 200)
     if m:
         fila["estado_alerta"] = capitalizar(m.group(1))
+        pos = m.end()
 
-    for linea in texto.splitlines():
+    # Titular: líneas en mayúsculas después del estado (los comunicados recientes lo traen)
+    resto = texto[texto.find(plano[pos - 20:pos].strip()[-12:]):] if pos else texto
+    titular = []
+    for linea in resto.splitlines()[1:12]:
         l = linea.strip()
         letras = [c for c in l if c.isalpha()]
-        if (len(l) >= 25 and letras and sum(c.isupper() for c in letras) / len(letras) > 0.9
-                and "COMUNICADO" not in l.upper()):
-            fila["titular"] = re.sub(r"\s+", " ", l)
+        mayus = bool(letras) and sum(c.isupper() for c in letras) / len(letras) > 0.9
+        if mayus and len(l) >= 15 and "RESUMEN" not in l.upper():
+            titular.append(l)
+        elif titular:
             break
+    if titular:
+        fila["titular"] = re.sub(r"\s+", " ", " ".join(titular))
+        i = plano.find(fila["titular"], pos)
+        if i != -1:
+            pos = i + len(fila["titular"])
 
-    for o in oraciones(texto):
-        if "magnitud" not in o.lower():
-            continue
-        region = region_de(o)
-        if region is None or fila[f"magnitud_{region}"]:
-            continue
-        # La magnitud es la que sigue a la palabra "magnitud" ("magnitud extraordinaria",
-        # "magnitud entre fuerte y extraordinaria"); el horizonte, el primer "hasta ..." después de ella.
-        pos = o.lower().index("magnitud")
-        cola = o[pos:]
-        rango = re.match(rf"magnitud(?:es)?\s+(?:\w+\s+){{0,3}}?entre\s+({MAG_RE.pattern[3:-3]})\s+y\s+({MAG_RE.pattern[3:-3]})",
-                         cola, re.I)
-        simple = re.match(rf"magnitud(?:es)?\s+(?:\w+\s+){{0,4}}?({MAG_RE.pattern[3:-3]})\b", cola, re.I)
-        if rango:
-            texto_mag = f"{rango.group(1)} a {rango.group(2)}"
-        elif simple:
-            texto_mag = simple.group(1)
-        else:
-            continue
-        fila[f"magnitud_{region}"] = texto_mag.lower().capitalize()
-        h = HORIZONTE.search(cola[:160])
-        if h:
-            fila[f"horizonte_{region}"] = "hasta " + re.sub(r"\s+", " ", h.group(1))
+    # Magnitud y horizonte: párrafo de Niño 1+2 (antes de la mención del Pacífico central)
+    # y párrafo de Niño 3.4 (desde esa mención hasta que el comunicado pasa a lluvias, ríos o pesca)
+    resumen = plano[pos:pos + 2500]
+    c34 = INICIO_34.search(resumen)
+    b12 = resumen[:c34.start()] if c34 else resumen
+    fila["magnitud_nino12"], fila["horizonte_nino12"] = leer_bloque(b12, anio)
+    if c34:
+        resto34 = resumen[c34.start():]
+        f = FIN_RESUMEN.search(resto34)
+        b34 = resto34[: f.start() if f else 900][:900]
+        fila["magnitud_nino34"], fila["horizonte_nino34"] = leer_bloque(b34, anio)
 
     m = PROXIMO.search(plano)
     if m:
@@ -172,6 +210,9 @@ def leer_probabilidades():
         errores.append(f"region debe ser una de {sorted(REGIONES_PROB)}")
     if not df["magnitud"].isin(MAGNITUDES_PROB).all():
         errores.append(f"magnitud debe ser una de {sorted(MAGNITUDES_PROB)}")
+    if ((df["region"] == "Niño 3.4") & (df["magnitud"] == "Extraordinaria")).any():
+        errores.append("Niño 3.4 usa la escala del RONI, cuya categoría más alta es 'Muy fuerte' "
+                       "(no existe 'Extraordinaria')")
     df["probabilidad"] = pd.to_numeric(df["probabilidad"], errors="coerce")
     if not df["probabilidad"].between(0, 100).all():
         errores.append("probabilidad debe ser un número entre 0 y 100 (sin el signo %)")
