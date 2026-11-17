@@ -35,8 +35,9 @@ def _estilo(fig, titulo_x, titulo_y, alto=360):
 
 
 # ------------------------------------------------------------------ configuración
-TABLA = "senamhi_hidrologia"
-VISTA, VISTA_ULTIMO = "v_senamhi_hidrologia", "v_senamhi_hidrologia_ultimo"
+PREFIJO = os.getenv("BQ_PREFIJO", "fen_7_")      # prefijo de las tablas del proyecto en BigQuery
+TABLA = PREFIJO + "senamhi_hidrologia"
+VISTA, VISTA_ULTIMO = PREFIJO + "v_senamhi_hidrologia", PREFIJO + "v_senamhi_hidrologia_ultimo"
 TZ = "America/Lima"
 PERIODOS = {"Últimas 24 h": 1, "Últimos 3 días": 3, "Últimos 7 días": 7, "Últimos 30 días": 30, "Últimos 90 días": 90}
 VARIABLES = {"CAUDAL": "Caudal", "NIVEL": "Nivel"}

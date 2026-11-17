@@ -27,7 +27,7 @@ sys.path.insert(0, str(RAIZ / "recolectores"))
 DIAG = {"claves_secrets": [], "error_secrets": None}
 try:
     DIAG["claves_secrets"] = list(st.secrets.keys())
-    for clave in ("GCP_SA_KEY", "BQ_PROYECTO", "BQ_DATASET", "NODERED_URL", "NODERED_TOKEN"):
+    for clave in ("GCP_SA_KEY", "BQ_PROYECTO", "BQ_DATASET", "BQ_PREFIJO", "NODERED_URL", "NODERED_TOKEN"):
         if clave in st.secrets:
             os.environ[clave] = str(st.secrets[clave]).strip()
 except Exception as e:  # sin secrets, o el bloque de secrets tiene un error de formato TOML
@@ -66,6 +66,11 @@ TEMP = ["DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "O
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 
 
+# Prefijo de las tablas de este proyecto en BigQuery (para distinguirlas de otras aplicaciones).
+# Se puede cambiar con BQ_PREFIJO en los secrets; el modo local (SQLite) usa los nombres sin prefijo.
+PREFIJO = os.getenv("BQ_PREFIJO", "fen_7_")
+
+
 @st.cache_data(ttl=3600, show_spinner="Leyendo datos...")
 def tabla(nombre, proyecto, dataset, firma_clave):
     """Devuelve (DataFrame, error). Nunca oculta el motivo de un fallo.
@@ -77,14 +82,14 @@ def tabla(nombre, proyecto, dataset, firma_clave):
     try:
         from google.api_core.exceptions import NotFound
         cliente = L.cliente_bigquery(proyecto)
-        ruta = L.ruta_bq(proyecto, nombre)[1]
+        ruta = L.ruta_bq(proyecto, PREFIJO + nombre)[1]
         df = cliente.list_rows(ruta).to_dataframe(create_bqstorage_client=False)
         for c in ("fecha", "emitido"):
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c]).dt.date
         return df, None
     except NotFound:
-        return pd.DataFrame(), f"no existe {L.ruta_bq(proyecto, nombre)[1]}"
+        return pd.DataFrame(), f"no existe {L.ruta_bq(proyecto, PREFIJO + nombre)[1]}"
     except Exception as e:
         return pd.DataFrame(), f"{type(e).__name__}: {str(e)[:300]}"
 
@@ -280,7 +285,7 @@ with v4:
     with g2:
         fig = go.Figure()
         bandas(fig, [(-1.5, 0.5, "#16222D", "Neutra"), (0.5, 1.3, "#1E2A2C", "Débil"), (1.3, 2.1, "#2A2E26", "Moderada"),
-                     (2.1, 3.0, "#3A2C22", "Fuerte"), (3.0, 4.5, "#46241F", "Extraordinaria")], -0.5, 11.5)
+                     (2.1, 3.5, "#3A2C22", "Fuerte"), (3.5, 5.0, "#46241F", "Extraordinaria")], -0.5, 11.5)
         for a, col_, nombre in [(anio, AZUL, str(anio)), (int(ult_icen.anio), ROJO, str(int(ult_icen.anio)))]:
             s = icen[icen.anio == a]
             fig.add_scatter(x=[MESES[m - 1] for m in s.mes], y=s.icen, mode="lines+markers", name=f"ICEN {nombre}",
@@ -426,7 +431,7 @@ with v3:
         fig = go.Figure()
         x0, x1 = reciente.fecha.min() - pd.Timedelta(days=15), reciente.fecha.max() + pd.Timedelta(days=15)
         bandas(fig, [(-1.5, 0.5, "#16222D", "Neutra"), (0.5, 1.3, "#1E2A2C", "Débil"), (1.3, 2.1, "#2A2E26", "Moderada"),
-                     (2.1, 3.0, "#3A2C22", "Fuerte"), (3.0, 4.5, "#46241F", "Extraordinaria")], x0, x1)
+                     (2.1, 3.5, "#3A2C22", "Fuerte"), (3.5, 5.0, "#46241F", "Extraordinaria")], x0, x1)
         fig.add_scatter(x=reciente.fecha, y=reciente.anom_nino12, name="Anomalía mensual Niño 1+2", line=dict(color=AZUL, dash="dash", width=2))
         fig.add_scatter(x=reciente.fecha, y=reciente.icen, name="ICEN", mode="lines+markers+text", text=reciente.icen.round(2),
                         textposition="top center", line=dict(color=AMBAR, width=4))
