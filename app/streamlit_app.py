@@ -7,6 +7,7 @@ Credenciales:      .streamlit/secrets.toml (GCP_SA_KEY, BQ_PROYECTO, BQ_DATASET)
                    Sin credenciales lee la base local de prueba 'datos_nino.db'.
 """
 import os
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -162,13 +163,15 @@ def bandas(fig, tramos, eje_x0, eje_x1):
         fig.add_annotation(x=eje_x1, y=(y0 + y1) / 2, text=texto, showarrow=False, xanchor="right", font=dict(size=10, color=GRIS))
 
 
-NOMBRES = ["icen", "roni", "nino_semanal", "tsm_costera", "lluvia_zonas", "lluvia_puntos", "lluvia_umbrales", "lluvia_satelite", "eventos_satelite"]
+NOMBRES = ["icen", "roni", "nino_semanal", "tsm_costera", "lluvia_zonas", "lluvia_puntos", "lluvia_umbrales", "lluvia_satelite",
+           "eventos_satelite", "calor_subsuperficial", "enfen_comunicados", "enfen_probabilidades"]
 import hashlib
 FIRMA = hashlib.sha256((os.getenv("GCP_SA_KEY") or "").encode()).hexdigest()[:12]
 LEIDAS = {n: tabla(n, os.getenv("BQ_PROYECTO"), os.getenv("BQ_DATASET"), FIRMA) for n in NOMBRES}
 icen, roni, sem = (LEIDAS[n][0] for n in ("icen", "roni", "nino_semanal"))
 tsm, zonas_df, puntos = (LEIDAS[n][0] for n in ("tsm_costera", "lluvia_zonas", "lluvia_puntos"))
 umbr, sat, ev = (LEIDAS[n][0] for n in ("lluvia_umbrales", "lluvia_satelite", "eventos_satelite"))
+cal, enf, enf_p = (LEIDAS[n][0] for n in ("calor_subsuperficial", "enfen_comunicados", "enfen_probabilidades"))
 esenciales = ["icen", "roni", "tsm_costera", "lluvia_zonas", "lluvia_puntos"]
 if any(LEIDAS[n][0].empty for n in esenciales):
     diagnostico({n: LEIDAS[n][1] or "OK" for n in NOMBRES})
@@ -179,13 +182,19 @@ if any(LEIDAS[n][0].empty for n in esenciales):
 if not tsm.empty:
     tsm = tsm.sort_values(["punto", "fecha"]).drop_duplicates(["punto", "fecha"], keep="last").reset_index(drop=True)
 icen = icen.sort_values(["anio", "mes"]).drop_duplicates(["anio", "mes"], keep="last").reset_index(drop=True)
-if not sem.empty and "fecha" in sem:
-    sem = sem.sort_values("fecha").drop_duplicates("fecha", keep="last").reset_index(drop=True)
+if not sem.empty and "semana" in sem:
+    sem["semana"] = pd.to_datetime(sem["semana"])
+    sem = sem.sort_values("semana").drop_duplicates("semana", keep="last").reset_index(drop=True)
 if not sat.empty and {"zona", "fecha"} <= set(sat.columns):
     sat = sat.sort_values(["zona", "fecha"]).reset_index(drop=True)
+if not cal.empty:
+    cal = cal.sort_values(["anio", "mes"]).drop_duplicates(["anio", "mes"], keep="last").reset_index(drop=True)
+    cal["fecha"] = pd.to_datetime(dict(year=cal["anio"], month=cal["mes"], day=1))
+if not enf.empty:
+    enf = enf.sort_values(["anio", "numero"]).reset_index(drop=True)
+    enf["fecha"] = pd.to_datetime(enf["fecha"])
 
 # Preparación
-icen = icen.sort_values(["anio", "mes"])
 icen["fecha"] = pd.to_datetime(dict(year=icen["anio"], month=icen["mes"], day=1))
 roni = roni.sort_values(["anio", "mes_central"])
 tsm["fecha"] = pd.to_datetime(tsm["fecha"])
@@ -198,119 +207,205 @@ resumen_z = pd.DataFrame([{
     "prob": 100 * z_hoy[(z_hoy.zona == z["zona"]) & (z_hoy.dias_adelante.between(0, 6))]["prob_ens_5mm"].max(),
 } for z in L.ZONAS]).set_index("zona")
 ult_icen = icen.dropna(subset=["icen"]).iloc[-1]
-ult_mes = icen.dropna(subset=["anom_nino12"]).iloc[-1]
 ult_roni = roni.iloc[-1]
 ult_dia = tsm["fecha"].max()
 tsm_hoy = tsm[tsm["fecha"] == ult_dia].set_index("punto")
+BANDAS_ICEN = [(-1.5, 0.5, "#16222D", "Neutra"), (0.5, 1.3, "#1E2A2C", "Débil"), (1.3, 2.1, "#2A2E26", "Moderada"),
+               (2.1, 3.5, "#3A2C22", "Fuerte"), (3.5, 5.0, "#46241F", "Extraordinaria")]
+
+
+def tendencia(serie, umbral=0.2):
+    """Último valor frente al promedio de los 4 anteriores: 'sube', 'baja' o 'estable'."""
+    s = serie.dropna()
+    if len(s) < 5:
+        return None, ""
+    dif = s.iloc[-1] - s.iloc[-5:-1].mean()
+    return dif, "sube" if dif > umbral else "baja" if dif < -umbral else "estable"
+
+
+def anomalia_mensual(icen, sem):
+    """Anomalía mensual de Niño 1+2 en tres versiones, sin tocar la tabla del ICEN:
+    medida (NOAA ERSSTv5, llega hasta jul-2026), estimada a partir del ICEN oficial
+    (siguiente = 3·ICEN − anterior − actual, como la vista v_anomalia_nino12_mensual, máx. 6 meses)
+    y el promedio mensual del Niño 1+2 semanal (OISST) para contrastar."""
+    base = icen.set_index(icen.anio * 12 + icen.mes - 1)
+    est = {}
+    medidos = base.index[base.anom_nino12.notna()]
+    if len(medidos) >= 2 and pd.notna(base.anom_nino12.get(medidos[-1] - 1)):
+        i = medidos[-1]
+        a_ant, a_act = base.anom_nino12[i - 1], base.anom_nino12[i]
+        for paso in range(1, 7):
+            ic = base.icen.get(i)
+            if ic is None or pd.isna(ic):
+                break
+            sig = 3 * ic - a_ant - a_act
+            est[i + 1] = (round(float(sig), 2), paso)
+            a_ant, a_act, i = a_act, sig, i + 1
+    d = pd.DataFrame({"i": sorted(set(base.index) | set(est))})
+    d["anio"], d["mes"] = d.i // 12, d.i % 12 + 1
+    d["fecha"] = pd.to_datetime(dict(year=d.anio, month=d.mes, day=1))
+    d["icen"] = d.i.map(base.icen)
+    d["medida"] = d.i.map(base.anom_nino12)
+    d["estimada"] = d.i.map(lambda k: est[k][0] if k in est else np.nan)
+    d["meses_estimados"] = d.i.map(lambda k: est[k][1] if k in est else np.nan)
+    d["semanal"] = np.nan
+    if not sem.empty:
+        g = sem.assign(i=sem.semana.dt.year * 12 + sem.semana.dt.month - 1).groupby("i")["anom_nino12"].mean().round(2)
+        d["semanal"] = d.i.map(g)
+    return d
+
+
+anom_mes = anomalia_mensual(icen, sem)
+dif_sem, tend_sem = tendencia(sem["anom_nino12"]) if not sem.empty else (None, "")
+ult_sem = sem.iloc[-1] if not sem.empty else None
+ult_enf = enf.iloc[-1] if not enf.empty else None
 
 # ------------------------------------------------------------------ Encabezado
 st.markdown(f"<span style='font-family:monospace;color:{AZUL};letter-spacing:.1em;font-size:12px'>SALA DE ANÁLISIS · EL NIÑO COSTERO</span>",
             unsafe_allow_html=True)
 st.title("Océano, lluvia y territorio: Virú, Chao y costa norte")
-st.caption(f"Mar al {ult_dia:%d-%b-%Y} · Lluvia emitida {ult_em} · ICEN {MESES[int(ult_icen.mes) - 1]}-{int(ult_icen.anio)} · "
-           f"Semanal {sem['semana'].max() if not sem.empty else '—'}")
+st.caption(" · ".join(x for x in [
+    f"ENFEN N° {ult_enf.comunicado} ({ult_enf.fecha:%d-%b})" if ult_enf is not None else "",
+    f"ICEN {MESES[int(ult_icen.mes) - 1]}-{int(ult_icen.anio)}",
+    f"Semanal al {ult_sem.semana:%d-%b}" if ult_sem is not None else "",
+    f"Mar al {ult_dia:%d-%b-%Y}",
+    f"Lluvia emitida {ult_em}"] if x))
 
-v1, v2, v3, v4, v5, v6 = st.tabs(["Monitoreo Hidrológico", "Territorio y lluvia", "Océano", "Panorama e historia", "Eventos históricos", "Resumen automático"])
+v_pan, v_oce, v_llu, v_hid, v_his = st.tabs(["Panorama", "Océano", "Lluvia", "Monitoreo hidrológico", "Eventos históricos"])
 
-# ================================================================== VISTA 1: PANORAMA E HISTORIA
-with v4:
-    c1, c2, c3 = st.columns([3, 1.2, 1.4])
-    atajos = {"1972-73": 1972, "1982-83": 1982, "1997-98": 1997, "2015-16": 2015, "2017 (costero)": 2017, "2023-24": 2023, "Otro año": None}
-    eleccion = c1.radio("Comparar 2026 con", list(atajos), index=2, horizontal=True)
-    anio = atajos[eleccion] or c2.number_input("Año", 1950, 2025, 1997, step=1)
-    modo = c3.radio("Modo", ["Mismo periodo", "Pico del año"], horizontal=True)
+# ================================================================== PANORAMA
+with v_pan:
+    # --- Postura oficial del ENFEN
+    if ult_enf is None:
+        st.info("Aún no hay comunicados del ENFEN cargados (tabla enfen_comunicados).")
+    else:
+        estado = ult_enf.estado_alerta or "Sin dato"
+        col_est = ROJO if estado.startswith("Alerta") else AMBAR if estado.startswith("Vigilancia") else GRIS
+        e1, e2 = st.columns([1.6, 1])
+        with e1:
+            titular = ult_enf.titular if isinstance(ult_enf.titular, str) and ult_enf.titular else ""
+            titular = re.sub(r"\b(el|la) ni(ñ)(o|a)\b", lambda m: f"{m.group(1).capitalize()} Ni{m.group(2)}{m.group(3)}",
+                             titular.capitalize(), flags=re.I)
+            h12 = f" · {ult_enf.horizonte_nino12}" if isinstance(ult_enf.horizonte_nino12, str) else ""
+            h34 = f" · {ult_enf.horizonte_nino34}" if isinstance(ult_enf.horizonte_nino34, str) else ""
+            prox = (f"<div style='font-size:12px;color:{GRIS};margin-top:8px'>Próximo comunicado: "
+                    f"{pd.to_datetime(ult_enf.proximo_comunicado):%d-%m-%Y}</div>") if pd.notna(ult_enf.proximo_comunicado) else ""
+            st.markdown(
+                f"<div style='background:{PANEL};color:#E6EDF3;border:1px solid {LINEA};border-radius:12px;padding:16px 18px'>"
+                f"<div style='font-size:12px;color:{GRIS};letter-spacing:.06em'>POSTURA OFICIAL · COMUNICADO ENFEN N° {ult_enf.comunicado} · "
+                f"{ult_enf.fecha:%d-%m-%Y}</div>"
+                f"<div style='margin:8px 0'><span style='background:{col_est};color:{FONDO};font-weight:700;border-radius:999px;"
+                f"padding:3px 12px'>{estado}</span></div>"
+                + (f"<div style='font-size:18px;font-weight:700;margin:6px 0 10px'>{titular}</div>" if titular else "")
+                + f"<div>🌊 <b>El Niño costero (Niño 1+2):</b> {ult_enf.magnitud_nino12 or '—'}{h12}</div>"
+                + f"<div>🌐 <b>Pacífico central (Niño 3.4):</b> {ult_enf.magnitud_nino34 or '—'}{h34}</div>"
+                + prox + "</div>",
+                unsafe_allow_html=True)
+            if isinstance(ult_enf.get("url"), str) and ult_enf.url:
+                st.link_button("Abrir el PDF del comunicado", ult_enf.url)
+        with e2:
+            st.markdown("**Probabilidades del ENFEN**")
+            if enf_p.empty:
+                st.caption("Sin probabilidades cargadas (datos/enfen_probabilidades.csv).")
+            else:
+                ord_c = enf[["comunicado", "anio", "numero"]]
+                pp = enf_p.merge(ord_c, on="comunicado", how="left").sort_values(["anio", "numero"])
+                ult_c = pp["comunicado"].iloc[-1]
+                pr = pp[pp.comunicado == ult_c]
+                for _, f in pr.iterrows():
+                    st.metric(f"{f.region} · {f.magnitud}", f"{f.probabilidad:.0f} %")
+                    st.caption(f"Periodo {f.periodo}" + (f" · {f.nota}" if isinstance(f.get("nota"), str) and f.nota else ""))
+                if ult_c != ult_enf.comunicado:
+                    st.caption(f"Del comunicado N° {ult_c}: el N° {ult_enf.comunicado} aún no tiene probabilidades cargadas.")
+    st.divider()
 
-    def valor_roni(a):
-        s = roni[roni.anio == a].set_index("mes_central")["roni"]
-        if s.empty:
-            return None, ""
-        if modo == "Pico del año":
-            return s.max(), TEMP[int(s.idxmax()) - 1]
-        m = int(ult_roni.mes_central)
-        return (s.get(m), TEMP[m - 1]) if m in s.index else (None, "")
+    # --- Indicadores clave
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("El Niño costero · ICEN", f"{ult_icen.icen:+.2f} °C")
+    k1.caption(f"{ult_icen.categoria} · {MESES[int(ult_icen.mes) - 1]}-{int(ult_icen.anio)} (índice oficial, IGP)")
+    if ult_sem is not None:
+        k2.metric("Mar Niño 1+2 · esta semana", f"{ult_sem.anom_nino12:+.2f} °C",
+                  None if dif_sem is None else f"{dif_sem:+.2f} °C vs 4 semanas", delta_color="inverse")
+        k2.caption(f"Semana del {ult_sem.semana:%d-%b} · {tend_sem}")
+    sal = tsm[tsm.punto == "Salaverry"].set_index("fecha")["anom_1991_2020"]
+    hace7 = sal.get(ult_dia - pd.Timedelta(days=7))
+    k3.metric("Mar frente a Salaverry", f"{tsm_hoy.loc['Salaverry', 'anom_1991_2020']:+.2f} °C",
+              None if hace7 is None or pd.isna(hace7) else f"{tsm_hoy.loc['Salaverry', 'anom_1991_2020'] - hace7:+.2f} °C vs 7 días",
+              delta_color="inverse")
+    k3.caption(f"Anomalía al {ult_dia:%d-%b} · {tsm_hoy.loc['Salaverry', 'sst']:.1f} °C")
+    k4.metric("El Niño global · RONI", f"{ult_roni.roni:+.2f} °C")
+    k4.caption(f"{ult_roni.temporada} {int(ult_roni.anio)} · {ult_roni.get('intensidad') or ''}")
+    k5.metric("Sierra de Virú · próx. 7 días", f"{resumen_z.loc['Cuenca alta Virú', 'futuro']:.1f} mm")
+    k5.caption(f"Prob. >5 mm/día: {resumen_z.loc['Cuenca alta Virú', 'prob']:.0f}% · referencia 30 mm")
 
-    def valor_icen(a):
-        s = icen[icen.anio == a].dropna(subset=["icen"]).set_index("mes")["icen"]
-        if s.empty:
-            return None, ""
-        if modo == "Pico del año":
-            return s.max(), MESES[int(s.idxmax()) - 1]
-        m = int(ult_icen.mes)
-        return (s.get(m), MESES[m - 1]) if m in s.index else (None, "")
+    # --- Lectura del día (reglas, sin IA)
+    st.markdown("**Lectura del día**")
+    vig = resumen_z[(resumen_z.index.str.startswith("Cuenca")) & (resumen_z.futuro >= 30)]
+    r97 = roni[(roni.anio == 1997) & (roni.mes_central == ult_roni.mes_central)]
+    v97 = None if r97.empty else float(r97["roni"].iloc[0])
+    lineas = []
+    if ult_enf is not None:
+        lineas.append(f"**Postura oficial:** comunicado ENFEN N° {ult_enf.comunicado} ({ult_enf.fecha:%d-%m-%Y}), {ult_enf.estado_alerta}. "
+                      f"El Niño costero {str(ult_enf.magnitud_nino12 or '—').lower()}"
+                      f"{' ' + ult_enf.horizonte_nino12 if isinstance(ult_enf.horizonte_nino12, str) else ''}; "
+                      f"Pacífico central {str(ult_enf.magnitud_nino34 or '—').lower()}"
+                      f"{' ' + ult_enf.horizonte_nino34 if isinstance(ult_enf.horizonte_nino34, str) else ''}.")
+    lineas.append(f"**El Niño costero:** ICEN de {MESES[int(ult_icen.mes) - 1]} {ult_icen.icen:+.2f} ({ult_icen.categoria})"
+                  + (f"; Niño 1+2 semanal {ult_sem.anom_nino12:+.2f} °C ({tend_sem} frente a las 4 semanas previas)." if ult_sem is not None else "."))
+    if not cal.empty:
+        uc = cal.dropna(subset=["t300_180w_100w"])
+        d_cal = uc.t300_180w_100w.iloc[-1] - uc.t300_180w_100w.iloc[-2]
+        lineas.append(f"**Calor bajo la superficie (0-300 m, 180°-100°O):** {uc.t300_180w_100w.iloc[-1]:+.2f} °C en "
+                      f"{MESES[int(uc.mes.iloc[-1]) - 1]}-{int(uc.anio.iloc[-1])}, {d_cal:+.2f} °C respecto al mes anterior "
+                      f"({'la reserva de calor sigue creciendo' if d_cal > 0.05 else 'la reserva de calor dejó de crecer' if d_cal < -0.05 else 'estable'}).")
+    lineas += [
+        f"**Mar:** frente a Salaverry {tsm_hoy.loc['Salaverry', 'sst']:.1f} °C, {tsm_hoy.loc['Salaverry', 'anom_1991_2020']:+.1f} °C sobre lo normal; "
+        f"rango costero de {tsm_hoy.anom_1991_2020.min():+.1f} a {tsm_hoy.anom_1991_2020.max():+.1f} °C.",
+        f"**El Niño global:** RONI {ult_roni.temporada} {ult_roni.roni:+.2f}" + (f" (1997 en el mismo trimestre: {v97:+.2f})." if v97 is not None else "."),
+        "**Lluvia:** " + ("; ".join(f"{z} con {q.futuro:.0f} mm previstos en 7 días (prob. {q.prob:.0f}%)" for z, q in vig.iterrows())
+                          + ", sobre la referencia de 30 mm." if not vig.empty else "ninguna cuenca alta supera la referencia de 30 mm."),
+    ]
+    for l in lineas:
+        st.markdown("- " + l)
+    st.caption("Lectura generada con reglas a partir de los datos del día (sin IA).")
 
-    def valor_mar(a, punto="Salaverry"):
-        s = tsm[(tsm.punto == punto) & (tsm.fecha.dt.year == a)]
-        if s.empty:
-            return None, "sin dato: la serie empieza en 1991"
-        if modo == "Pico del año":
-            f = s.loc[s["anom_1991_2020"].idxmax()]
-            return f["anom_1991_2020"], f"{f['fecha']:%d-%b}"
-        d = ult_dia.replace(year=a)
-        cerca = s[(s.fecha >= d - timedelta(days=3)) & (s.fecha <= d + timedelta(days=3))]
-        return (cerca["anom_1991_2020"].mean(), f"{d:%d-%b}") if not cerca.empty else (None, "")
+    # --- Historial de comunicados
+    if not enf.empty:
+        with st.expander(f"Historial de comunicados del ENFEN ({len(enf)})"):
+            ESCALA = {"débil": 1, "moderada": 2, "fuerte": 3, "muy fuerte": 4, "extraordinaria": 4}
 
-    def valor_sierra(a):
-        if a < 2000:
-            return None, "sin dato: satélite desde 2000"
-        e = ev[(pd.to_datetime(ev["fecha"]).dt.year == a) & (ev["cuenca_alta"] == "Cuenca alta Virú")] if not ev.empty else ev
-        if e is None or e.empty:
-            return None, "sin evento registrado ese año"
-        return e["acum_7d_cuenca"].max(), "previo a emergencia INDECI"
+            def nivel(t):
+                """Magnitud en número (1 débil … 4 extraordinaria / muy fuerte); un rango toma el promedio."""
+                if not isinstance(t, str):
+                    return np.nan
+                t, v = t.lower(), []
+                for k in ("muy fuerte", "extraordinaria", "moderada", "débil", "fuerte"):
+                    if k in t:
+                        v.append(ESCALA[k])
+                        t = t.replace(k, "")
+                return float(np.mean(v)) if v else np.nan
 
-    k1, k2, k3, k4 = st.columns(4)
-    for col, titulo, hoy, fn, unidad, nota in [
-        (k1, "El Niño global · RONI", ult_roni.roni, valor_roni, "°C", f"{ult_roni.temporada} {int(ult_roni.anio)}"),
-        (k2, "El Niño costero · ICEN", ult_icen.icen, valor_icen, "°C", f"{ult_icen.categoria} · {MESES[int(ult_icen.mes) - 1]}"),
-        (k3, "Mar frente a Salaverry", tsm_hoy.loc["Salaverry", "anom_1991_2020"], valor_mar, "°C", f"anomalía al {ult_dia:%d-%b}"),
-        (k4, "Sierra de Virú · próx. 7 días", resumen_z.loc["Cuenca alta Virú", "futuro"], valor_sierra, "mm", "pronóstico (comparación: satélite)"),
-    ]:
-        comp, cuando = fn(anio)
-        delta = None if comp is None or pd.isna(comp) else f"{hoy - comp:+.2f} {unidad} vs {anio}"
-        col.metric(titulo, f"{hoy:+.2f} {unidad}" if unidad == "°C" else f"{hoy:.1f} {unidad}", delta, delta_color="off")
-        col.caption(f"{nota} · {anio}: " + (f"**{comp:+.2f} {unidad}** ({cuando})" if comp is not None and not pd.isna(comp) and unidad == "°C"
-                                             else f"**{comp:.1f} {unidad}** ({cuando})" if comp is not None and not pd.isna(comp) else cuando or "sin dato"))
+            fig = go.Figure()
+            # Niño 3.4 punteado y debajo, para que no tape a Niño 1+2 cuando coinciden
+            for col_m, nombre, color, ancho, trazo in [("magnitud_nino34", "Pacífico central (Niño 3.4)", AZUL, 2, "dash"),
+                                                       ("magnitud_nino12", "El Niño costero (Niño 1+2)", ROJO, 4, "solid")]:
+                fig.add_scatter(x=enf.fecha, y=enf[col_m].map(nivel), mode="lines+markers", name=nombre, line_shape="hv",
+                                line=dict(color=color, width=ancho, dash=trazo), customdata=np.stack([enf.comunicado, enf[col_m].fillna("—")], axis=-1),
+                                hovertemplate="N° %{customdata[0]} · %{x|%d-%b}<br>%{customdata[1]}<extra>" + nombre + "</extra>")
+            fig.update_yaxes(tickvals=[1, 2, 3, 4], ticktext=["Débil", "Moderada", "Fuerte", "Extraord. / Muy fuerte"], range=[0.5, 4.5])
+            st.markdown("**Magnitud esperada según cada comunicado**")
+            st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Fecha del comunicado", "Magnitud", 300))
+            vista = enf.sort_values(["anio", "numero"], ascending=False)[
+                ["comunicado", "fecha", "estado_alerta", "magnitud_nino12", "horizonte_nino12", "magnitud_nino34", "horizonte_nino34", "url"]].copy()
+            for c_txt in ("estado_alerta", "magnitud_nino12", "horizonte_nino12", "magnitud_nino34", "horizonte_nino34"):
+                vista[c_txt] = vista[c_txt].fillna("—")
+            st.dataframe(vista, hide_index=True, width="stretch", column_config={
+                "comunicado": "N°", "fecha": st.column_config.DateColumn("Fecha", format="DD-MM-YYYY"), "estado_alerta": "Estado",
+                "magnitud_nino12": "Niño 1+2", "horizonte_nino12": "Horizonte 1+2", "magnitud_nino34": "Niño 3.4",
+                "horizonte_nino34": "Horizonte 3.4", "url": st.column_config.LinkColumn("PDF", display_text="Abrir")})
 
-    g1, g2 = st.columns(2)
-    with g1:
-        fig = go.Figure()
-        bandas(fig, [(-2.5, -0.5, "#132538", "La Niña"), (0.5, 1, "#1E2A2C", "Débil"), (1, 1.5, "#2A2E26", "Moderado"),
-                     (1.5, 2, "#3A2C22", "Fuerte"), (2, 3, "#46241F", "Muy fuerte")], -0.5, 11.5)
-        for a, col_, ancho, nombre in [(anio, AZUL, 3, str(anio)), (int(ult_roni.anio), ROJO, 4, str(int(ult_roni.anio)))]:
-            s = roni[roni.anio == a].sort_values("mes_central")
-            fig.add_scatter(x=[TEMP[m - 1] for m in s.mes_central], y=s.roni, mode="lines+markers", name=nombre,
-                            line=dict(color=col_, width=ancho, dash="dash" if a == anio else "solid"))
-        fig.update_xaxes(categoryorder="array", categoryarray=TEMP)
-        st.markdown("**Años análogos · El Niño global (RONI)**")
-        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Trimestre móvil (DJF = dic-ene-feb)", "RONI (°C)"))
-    with g2:
-        fig = go.Figure()
-        bandas(fig, [(-1.5, 0.5, "#16222D", "Neutra"), (0.5, 1.3, "#1E2A2C", "Débil"), (1.3, 2.1, "#2A2E26", "Moderada"),
-                     (2.1, 3.5, "#3A2C22", "Fuerte"), (3.5, 5.0, "#46241F", "Extraordinaria")], -0.5, 11.5)
-        for a, col_, nombre in [(anio, AZUL, str(anio)), (int(ult_icen.anio), ROJO, str(int(ult_icen.anio)))]:
-            s = icen[icen.anio == a]
-            fig.add_scatter(x=[MESES[m - 1] for m in s.mes], y=s.icen, mode="lines+markers", name=f"ICEN {nombre}",
-                            line=dict(color=col_, width=4 if col_ == ROJO else 3, dash="dash" if col_ == AZUL else "solid"))
-        fig.update_xaxes(categoryorder="array", categoryarray=MESES)
-        st.markdown("**Años análogos · El Niño costero (ICEN)**")
-        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "ICEN (°C)"))
-
-    if anio >= 1991:
-        fig = go.Figure()
-        for a, col_ in [(anio, AZUL), (ult_dia.year, ROJO)]:
-            s = tsm[(tsm.punto == "Salaverry") & (tsm.fecha.dt.year == a)]
-            # Todas las series se llevan a un mismo año de referencia (2000, bisiesto) para comparar por mes y día;
-            # la fecha real se muestra al pasar el cursor.
-            x_ref = pd.to_datetime({"year": 2000, "month": s.fecha.dt.month, "day": s.fecha.dt.day})
-            fig.add_scatter(x=x_ref, y=s.anom_1991_2020, mode="lines", name=str(a), customdata=s.fecha.dt.strftime("%d/%m/%Y"),
-                            hovertemplate="%{customdata}<br>Anomalía: %{y:+.2f} °C<extra>" + str(a) + "</extra>",
-                            line=dict(color=col_, width=2.5 if col_ == ROJO else 1.8))
-        fig.add_hline(y=0, line_color=GRIS)
-        fig.update_xaxes(tickvals=pd.date_range("2000-01-01", periods=12, freq="MS"), ticktext=MESES, range=["2000-01-01", "2000-12-31"])
-        st.markdown(f"**Mar frente a Salaverry: {ult_dia.year} vs {anio}** (anomalía diaria)")
-        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía de temperatura (°C)", 320))
-
-# ================================================================== VISTA 2: TERRITORIO Y LLUVIA
-with v2:
+# ================================================================== LLUVIA
+with v_llu:
     import folium
     from streamlit_folium import st_folium
 
@@ -423,33 +518,76 @@ with v2:
         with st.expander("Umbrales usados por zona (SENAMHI y modelo)"):
             st.dataframe(umbr[["zona", "p75", "p90", "p95", "p99", "fuente_umbral"]], hide_index=True, width="stretch")
 
-# ================================================================== VISTA 3: OCÉANO
-with v3:
+# ================================================================== OCÉANO
+with v_oce:
+    st.subheader("El mar ahora")
     o1, o2 = st.columns(2)
-    reciente = icen[icen.fecha >= icen.fecha.max() - pd.DateOffset(months=14)]
     with o1:
-        fig = go.Figure()
-        x0, x1 = reciente.fecha.min() - pd.Timedelta(days=15), reciente.fecha.max() + pd.Timedelta(days=15)
-        bandas(fig, [(-1.5, 0.5, "#16222D", "Neutra"), (0.5, 1.3, "#1E2A2C", "Débil"), (1.3, 2.1, "#2A2E26", "Moderada"),
-                     (2.1, 3.5, "#3A2C22", "Fuerte"), (3.5, 5.0, "#46241F", "Extraordinaria")], x0, x1)
-        fig.add_scatter(x=reciente.fecha, y=reciente.anom_nino12, name="Anomalía mensual Niño 1+2", line=dict(color=AZUL, dash="dash", width=2))
-        fig.add_scatter(x=reciente.fecha, y=reciente.icen, name="ICEN", mode="lines+markers+text", text=reciente.icen.round(2),
-                        textposition="top center", line=dict(color=AMBAR, width=4))
-        st.markdown("**Líneas con bandas de anomalía: Niño 1+2 e ICEN**")
-        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía (°C)"))
+        if sem.empty:
+            st.info("Sin datos semanales (tabla nino_semanal).")
+        else:
+            u = sem[sem.semana >= sem.semana.max() - pd.Timedelta(weeks=26)]
+            fig = go.Figure()
+            fig.add_scatter(x=u.semana, y=u.anom_nino12, name="Niño 1+2 (costa)", mode="lines+markers", line=dict(color=ROJO, width=3))
+            fig.add_scatter(x=u.semana, y=u.anom_nino34, name="Niño 3.4 (Pacífico central)", mode="lines+markers", line=dict(color=AZUL, width=2))
+            fig.add_hline(y=0, line_color=GRIS)
+            for col_s, color in (("anom_nino12", ROJO), ("anom_nino34", AZUL)):
+                fig.add_annotation(x=u.semana.iloc[-1], y=u[col_s].iloc[-1], text=f"{u[col_s].iloc[-1]:+.1f}", showarrow=False,
+                                   xanchor="left", xshift=8, font=dict(color=color, size=13))
+            st.markdown(f"**Anomalía semanal del mar · últimos 6 meses** · Niño 1+2 {tend_sem}"
+                        + (f" ({dif_sem:+.2f} °C frente a las 4 semanas previas)" if dif_sem is not None else ""))
+            st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana", "Anomalía (°C)"))
     with o2:
-        ult8 = icen.dropna(subset=["anom_nino12"]).tail(8)
-        etiquetas = [f"{MESES[m - 1]}-{str(a)[2:]}" for a, m in zip(ult8.anio, ult8.mes)]
+        rec = anom_mes[anom_mes.fecha >= anom_mes.fecha.max() - pd.DateOffset(months=15)]
         fig = go.Figure()
-        fig.add_bar(y=etiquetas, x=ult8.anom_nino12, orientation="h", name="Niño 1+2 (costa)",
-                    marker_color=[ROJO if v >= 0 else "#3D7EA6" for v in ult8.anom_nino12], text=ult8.anom_nino12.round(2), textposition="outside")
-        fig.add_bar(y=etiquetas, x=ult8.anom_nino34, orientation="h", name="Niño 3.4 (Pacífico central)",
-                    marker_color=[AZUL if v >= 0 else "#2B5878" for v in ult8.anom_nino34])
-        fig.add_vline(x=0, line_color=GRIS)
-        fig.update_layout(barmode="group")
-        st.markdown("**Barras divergentes: costa vs Pacífico central**")
-        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Anomalía de temperatura del mar (°C)", "Mes"))
+        x0, x1 = rec.fecha.min() - pd.Timedelta(days=15), rec.fecha.max() + pd.Timedelta(days=15)
+        bandas(fig, BANDAS_ICEN, x0, x1)
+        fig.add_scatter(x=rec.fecha, y=rec.icen, name="ICEN oficial (IGP)", mode="lines+markers+text", text=rec.icen.round(2),
+                        textposition="top center", line=dict(color=AMBAR, width=4))
+        fig.add_scatter(x=rec.fecha, y=rec.medida, name="Anomalía mensual medida", mode="lines+markers", line=dict(color=AZUL, width=2))
+        unidas = rec[rec.estimada.notna() | rec.fecha.eq(rec.loc[rec.medida.notna(), "fecha"].max())]
+        fig.add_scatter(x=unidas.fecha, y=unidas.estimada.fillna(unidas.medida), name="Anomalía mensual estimada desde el ICEN",
+                        mode="lines+markers", line=dict(color=AZUL, width=2, dash="dash"), marker=dict(symbol="circle-open", size=9))
+        fig.add_scatter(x=rec.fecha, y=rec.semanal, name="Promedio del Niño 1+2 semanal", mode="markers",
+                        marker=dict(color="#E6EDF3", symbol="diamond", size=8))
+        st.markdown("**ICEN y anomalía mensual de Niño 1+2**")
+        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía (°C)"))
+        if rec.estimada.notna().any():
+            st.caption("La anomalía medida (NOAA ERSSTv5) llega hasta julio 2026. Los meses siguientes se estiman despejando la media "
+                       "móvil del ICEN oficial; cada mes estimado acumula más error, por eso se contrasta con el promedio semanal.")
 
+    st.subheader("Calor bajo la superficie del Pacífico ecuatorial")
+    if cal.empty:
+        st.info("Aún no hay datos de calor subsuperficial (tabla calor_subsuperficial).")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            u = cal[cal.fecha >= cal.fecha.max() - pd.DateOffset(months=36)]
+            fig = go.Figure()
+            for col_c, nombre, color, ancho in [("t300_180w_100w", "Centro-oriente (180°-100°O)", ROJO, 3),
+                                                ("t300_160e_80w", "Centro y oriente (160°E-80°O)", AMBAR, 2),
+                                                ("t300_130e_80w", "Todo el Pacífico ecuatorial (130°E-80°O)", AZUL, 2)]:
+                fig.add_scatter(x=u.fecha, y=u[col_c], name=nombre, mode="lines", line=dict(color=color, width=ancho))
+            fig.add_hline(y=0, line_color=GRIS)
+            st.markdown("**Anomalía de temperatura de los primeros 300 m · últimos 3 años**")
+            st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía 0-300 m (°C)"))
+        with c2:
+            anios = st.multiselect("Comparar con", [a for a in (1982, 1997, 2015, 2017, 2023) if a in set(cal.anio)],
+                                   default=[a for a in (1997, 2015, 2023) if a in set(cal.anio)])
+            fig = go.Figure()
+            act = int(cal.anio.max())
+            for a in anios + [act]:
+                s = cal[cal.anio == a]
+                fig.add_scatter(x=[MESES[m - 1] for m in s.mes], y=s.t300_180w_100w, mode="lines+markers", name=str(a),
+                                line=dict(width=4 if a == act else 2, color=ROJO if a == act else None, dash="solid" if a == act else "dash"))
+            fig.update_xaxes(categoryorder="array", categoryarray=MESES)
+            fig.add_hline(y=0, line_color=GRIS)
+            st.markdown(f"**{act} frente a otros años · franja 180°-100°O**")
+            st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía 0-300 m (°C)"))
+        st.caption("Es la reserva de calor que las ondas Kelvin llevan hacia la costa: suele adelantarse 1 a 3 meses a lo que luego "
+                   "aparece en la superficie. Fuente: NOAA CPC, análisis GODAS, climatología 1981-2010.")
+
+    st.subheader("Costa peruana, de norte a sur")
     o3, o4, o5 = st.columns([1.1, 1, 1])
     puertos = {p["punto"]: p for p in T.PUNTOS}
     with o3:
@@ -461,8 +599,8 @@ with v3:
             folium.Rectangle([(f.lat_celda - 0.125, f.lon_celda - 0.125), (f.lat_celda + 0.125, f.lon_celda + 0.125)], color=col_, fill=True,
                              fill_opacity=0.4, tooltip=f"Celda satelital de {nombre}: {f.lat_celda:.3f}, {f.lon_celda:.3f}").add_to(mm)
             if p:
-                folium.CircleMarker((p["lat"], p["lon"]), radius=f.anom_1991_2020 * 1.6, color="#FFFFFF", weight=1, fill=True, fill_color=col_, fill_opacity=0.9,
-                                    tooltip=f"<b>{nombre}</b><br>Hoy {f.sst:.1f} °C · normal {f.sst_clima:.1f} °C<br>Anomalía +{f.anom_1991_2020:.2f} °C<br>Celda a {f.distancia_km} km").add_to(mm)
+                folium.CircleMarker((p["lat"], p["lon"]), radius=max(f.anom_1991_2020, 0.5) * 1.6, color="#FFFFFF", weight=1, fill=True, fill_color=col_, fill_opacity=0.9,
+                                    tooltip=f"<b>{nombre}</b><br>Hoy {f.sst:.1f} °C · normal {f.sst_clima:.1f} °C<br>Anomalía {f.anom_1991_2020:+.2f} °C<br>Celda a {f.distancia_km} km").add_to(mm)
                 folium.PolyLine([(p["lat"], p["lon"]), (f.lat_celda, f.lon_celda)], color=GRIS, weight=1).add_to(mm)
         folium.LayerControl().add_to(mm)
         st.markdown("**Mapa del mar: puerto y celda satelital**")
@@ -475,9 +613,9 @@ with v3:
             fig.add_scatter(x=[f.sst_clima, f.sst], y=[nombre, nombre], mode="lines", line=dict(color=AMBAR, width=4), showlegend=False)
         fig.add_scatter(x=tsm_hoy.loc[orden, "sst_clima"], y=orden, mode="markers", name="Normal 1991–2020", marker=dict(color=AZUL, size=12))
         fig.add_scatter(x=tsm_hoy.loc[orden, "sst"], y=orden, mode="markers+text", name="Hoy", marker=dict(color=ROJO, size=12),
-                        text=[f"+{v:.1f}" for v in tsm_hoy.loc[orden, "anom_1991_2020"]], textposition="middle right")
+                        text=[f"{v:+.1f}" for v in tsm_hoy.loc[orden, "anom_1991_2020"]], textposition="middle right")
         fig.update_yaxes(autorange="reversed")
-        st.markdown("**Dumbbell: normal vs hoy**")
+        st.markdown("**Normal frente a hoy**")
         st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Temperatura del mar (°C)", "Puerto (norte a sur)", 480))
     with o5:
         lat = [puertos[n]["lat"] for n in orden]
@@ -485,7 +623,7 @@ with v3:
         fig.add_scatter(x=lat, y=tsm_hoy.loc[orden, "anom_1991_2020"], mode="markers+text", text=orden, textposition="top center",
                         marker=dict(size=14, color=ROJO), showlegend=False)
         fig.update_xaxes(autorange="reversed")
-        st.markdown("**Dispersión: anomalía vs latitud**")
+        st.markdown("**Anomalía según la latitud**")
         st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Latitud del puerto (°S), norte → sur", "Anomalía (°C)", 480))
 
     o6, o7 = st.columns(2)
@@ -498,21 +636,118 @@ with v3:
         st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Fecha", "Temperatura del mar (°C)"))
     with o7:
         if not sem.empty:
-            u = sem.sort_values("semana").tail(8)
+            u = sem.tail(8)
             filas = {"Niño 1+2 · T": u.anom_nino12, "Niño 1+2 · R": u.get("rel_anom_nino12"), "Niño 3.4 · T": u.anom_nino34, "Niño 3.4 · R": u.get("rel_anom_nino34")}
             filas = {k: v for k, v in filas.items() if v is not None}
             z = [list(v) for v in filas.values()]
-            fig = go.Figure(go.Heatmap(z=z, x=[str(d) for d in u.semana], y=list(filas), colorscale=[[0, "#6B2E22"], [0.5, ROJO], [1, "#F7C6B8"]],
+            fig = go.Figure(go.Heatmap(z=z, x=[f"{d:%d-%b}" for d in u.semana], y=list(filas), colorscale=[[0, "#6B2E22"], [0.5, ROJO], [1, "#F7C6B8"]],
                                        text=[[f"{x:+.1f}" for x in fila] for fila in z], texttemplate="%{text}", colorbar=dict(title="°C")))
-            st.markdown("**Mapa de calor: regiones Niño por semana** (T: tradicional · R: relativa)")
+            st.markdown("**Regiones Niño por semana** (T: tradicional · R: relativa)")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana (centrada en miércoles)", "Serie"))
-# ================================================================== VISTA 5: EVENTOS HISTÓRICOS
-with v1:
+
+# ================================================================== MONITOREO HIDROLÓGICO
+with v_hid:
     render_monitoreo_hidrologico(cliente_fn=lambda: L.cliente_bigquery(os.getenv("BQ_PROYECTO")))
 
+# ================================================================== EVENTOS HISTÓRICOS
+with v_his:
+    st.subheader("2026 frente a años anteriores")
+    c1, c2, c3 = st.columns([3, 1.2, 1.4])
+    atajos = {"1972-73": 1972, "1982-83": 1982, "1997-98": 1997, "2015-16": 2015, "2017 (costero)": 2017, "2023-24": 2023, "Otro año": None}
+    eleccion = c1.radio("Comparar 2026 con", list(atajos), index=2, horizontal=True)
+    anio = atajos[eleccion] or c2.number_input("Año", 1950, 2025, 1997, step=1)
+    modo = c3.radio("Modo", ["Mismo periodo", "Pico del año"], horizontal=True)
 
-# ================================================================== VISTA 5: EVENTOS HISTÓRICOS
-with v5:
+    def valor_roni(a):
+        s = roni[roni.anio == a].set_index("mes_central")["roni"]
+        if s.empty:
+            return None, ""
+        if modo == "Pico del año":
+            return s.max(), TEMP[int(s.idxmax()) - 1]
+        m = int(ult_roni.mes_central)
+        return (s.get(m), TEMP[m - 1]) if m in s.index else (None, "")
+
+    def valor_icen(a):
+        s = icen[icen.anio == a].dropna(subset=["icen"]).set_index("mes")["icen"]
+        if s.empty:
+            return None, ""
+        if modo == "Pico del año":
+            return s.max(), MESES[int(s.idxmax()) - 1]
+        m = int(ult_icen.mes)
+        return (s.get(m), MESES[m - 1]) if m in s.index else (None, "")
+
+    def valor_mar(a, punto="Salaverry"):
+        s = tsm[(tsm.punto == punto) & (tsm.fecha.dt.year == a)]
+        if s.empty:
+            return None, "sin dato: la serie empieza en 1991"
+        if modo == "Pico del año":
+            f = s.loc[s["anom_1991_2020"].idxmax()]
+            return f["anom_1991_2020"], f"{f['fecha']:%d-%b}"
+        d = ult_dia.replace(year=a)
+        cerca = s[(s.fecha >= d - timedelta(days=3)) & (s.fecha <= d + timedelta(days=3))]
+        return (cerca["anom_1991_2020"].mean(), f"{d:%d-%b}") if not cerca.empty else (None, "")
+
+    def valor_sierra(a):
+        if a < 2000:
+            return None, "sin dato: satélite desde 2000"
+        e = ev[(pd.to_datetime(ev["fecha"]).dt.year == a) & (ev["cuenca_alta"] == "Cuenca alta Virú")] if not ev.empty else ev
+        if e is None or e.empty:
+            return None, "sin evento registrado ese año"
+        return e["acum_7d_cuenca"].max(), "previo a emergencia INDECI"
+
+    k1, k2, k3, k4 = st.columns(4)
+    for col, titulo, hoy, fn, unidad, nota in [
+        (k1, "El Niño global · RONI", ult_roni.roni, valor_roni, "°C", f"{ult_roni.temporada} {int(ult_roni.anio)}"),
+        (k2, "El Niño costero · ICEN", ult_icen.icen, valor_icen, "°C", f"{ult_icen.categoria} · {MESES[int(ult_icen.mes) - 1]}"),
+        (k3, "Mar frente a Salaverry", tsm_hoy.loc["Salaverry", "anom_1991_2020"], valor_mar, "°C", f"anomalía al {ult_dia:%d-%b}"),
+        (k4, "Sierra de Virú · próx. 7 días", resumen_z.loc["Cuenca alta Virú", "futuro"], valor_sierra, "mm", "pronóstico (comparación: satélite)"),
+    ]:
+        comp, cuando = fn(anio)
+        delta = None if comp is None or pd.isna(comp) else f"{hoy - comp:+.2f} {unidad} vs {anio}"
+        col.metric(titulo, f"{hoy:+.2f} {unidad}" if unidad == "°C" else f"{hoy:.1f} {unidad}", delta, delta_color="off")
+        col.caption(f"{nota} · {anio}: " + (f"**{comp:+.2f} {unidad}** ({cuando})" if comp is not None and not pd.isna(comp) and unidad == "°C"
+                                             else f"**{comp:.1f} {unidad}** ({cuando})" if comp is not None and not pd.isna(comp) else cuando or "sin dato"))
+
+    g1, g2 = st.columns(2)
+    with g1:
+        fig = go.Figure()
+        bandas(fig, [(-2.5, -0.5, "#132538", "La Niña"), (0.5, 1, "#1E2A2C", "Débil"), (1, 1.5, "#2A2E26", "Moderado"),
+                     (1.5, 2, "#3A2C22", "Fuerte"), (2, 3, "#46241F", "Muy fuerte")], -0.5, 11.5)
+        for a, col_, ancho, nombre in [(anio, AZUL, 3, str(anio)), (int(ult_roni.anio), ROJO, 4, str(int(ult_roni.anio)))]:
+            s = roni[roni.anio == a].sort_values("mes_central")
+            fig.add_scatter(x=[TEMP[m - 1] for m in s.mes_central], y=s.roni, mode="lines+markers", name=nombre,
+                            line=dict(color=col_, width=ancho, dash="dash" if a == anio else "solid"))
+        fig.update_xaxes(categoryorder="array", categoryarray=TEMP)
+        st.markdown("**Años análogos · El Niño global (RONI)**")
+        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Trimestre móvil (DJF = dic-ene-feb)", "RONI (°C)"))
+    with g2:
+        fig = go.Figure()
+        bandas(fig, BANDAS_ICEN, -0.5, 11.5)
+        for a, col_, nombre in [(anio, AZUL, str(anio)), (int(ult_icen.anio), ROJO, str(int(ult_icen.anio)))]:
+            s = icen[icen.anio == a]
+            fig.add_scatter(x=[MESES[m - 1] for m in s.mes], y=s.icen, mode="lines+markers", name=f"ICEN {nombre}",
+                            line=dict(color=col_, width=4 if col_ == ROJO else 3, dash="dash" if col_ == AZUL else "solid"))
+        fig.update_xaxes(categoryorder="array", categoryarray=MESES)
+        st.markdown("**Años análogos · El Niño costero (ICEN)**")
+        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "ICEN (°C)"))
+
+    if anio >= 1991:
+        fig = go.Figure()
+        for a, col_ in [(anio, AZUL), (ult_dia.year, ROJO)]:
+            s = tsm[(tsm.punto == "Salaverry") & (tsm.fecha.dt.year == a)]
+            # Todas las series se llevan a un mismo año de referencia (2000, bisiesto) para comparar por mes y día;
+            # la fecha real se muestra al pasar el cursor.
+            x_ref = pd.to_datetime({"year": 2000, "month": s.fecha.dt.month, "day": s.fecha.dt.day})
+            fig.add_scatter(x=x_ref, y=s.anom_1991_2020, mode="lines", name=str(a), customdata=s.fecha.dt.strftime("%d/%m/%Y"),
+                            hovertemplate="%{customdata}<br>Anomalía: %{y:+.2f} °C<extra>" + str(a) + "</extra>",
+                            line=dict(color=col_, width=2.5 if col_ == ROJO else 1.8))
+        fig.add_hline(y=0, line_color=GRIS)
+        fig.update_xaxes(tickvals=pd.date_range("2000-01-01", periods=12, freq="MS"), ticktext=MESES, range=["2000-01-01", "2000-12-31"])
+        st.markdown(f"**Mar frente a Salaverry: {ult_dia.year} vs {anio}** (anomalía diaria)")
+        st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía de temperatura (°C)", 320))
+
+    st.divider()
+    st.subheader("Emergencias INDECI en Virú y Chao")
     if ev.empty:
         st.info("La tabla eventos_satelite aún no existe.")
     else:
@@ -528,7 +763,7 @@ with v5:
                             hovertemplate="%{customdata[0]} · %{customdata[1]}<br>%{customdata[2]}<br>Sierra 7 d: %{x} mm · valle: %{y} mm<extra></extra>")
         fig.add_vline(x=30, line_color=AMBAR, line_dash="dash", annotation_text="30 mm sierra")
         fig.add_hline(y=6.02, line_color=ROJO, line_dash="dash", annotation_text="P99 SENAMHI 6.02 mm")
-        st.markdown("**Emergencias INDECI: ¿dónde llovió antes del daño?** · satélite NASA IMERG, 7 días previos (círculo: Virú · cuadrado: Chao)")
+        st.markdown("**¿Dónde llovió antes del daño?** · satélite NASA IMERG, 7 días previos (círculo: Virú · cuadrado: Chao)")
         st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Lluvia acumulada 7 días en la cuenca alta (mm)", "Lluvia máxima diaria en el valle (mm)", 460))
         e["roni"] = [roni[(roni.anio == f.year) & (roni.mes_central == f.month)]["roni"].squeeze() if not roni[(roni.anio == f.year) & (roni.mes_central == f.month)].empty else None for f in e.fecha]
         st.dataframe(e[["fecha", "zona", "localidades", "lluvia_max_dia", "acum_3d_cuenca", "acum_7d_cuenca", "indicio_origen", "roni"]]
@@ -536,25 +771,7 @@ with v5:
                                       "indicio_origen": "indicio", "roni": "RONI ese mes"}).sort_values("fecha"),
                      hide_index=True, width="stretch")
 
-# ================================================================== VISTA 6: RESUMEN AUTOMÁTICO
-with v6:
-    st.caption("Resumen generado con reglas a partir de los datos del día (sin IA). Es la base sobre la que un modelo de lenguaje "
-               "redactaría el resumen ejecutivo en una fase posterior.")
-    vig = resumen_z[(resumen_z.index.str.startswith("Cuenca")) & (resumen_z.futuro >= 30)]
-    r97 = roni[(roni.anio == 1997) & (roni.mes_central == ult_roni.mes_central)]
-    v97 = None if r97.empty else float(r97['roni'].iloc[0])
-    lineas = [
-        f"**El Niño costero:** ICEN de {MESES[int(ult_icen.mes) - 1]} {ult_icen.icen:+.2f} ({ult_icen.categoria}); "
-        f"anomalía mensual más reciente de Niño 1+2 {ult_mes.anom_nino12:+.2f} °C.",
-        f"**Mar:** frente a Salaverry {tsm_hoy.loc['Salaverry', 'sst']:.1f} °C, {tsm_hoy.loc['Salaverry', 'anom_1991_2020']:+.1f} °C sobre lo normal; "
-        f"rango costero de {tsm_hoy.anom_1991_2020.min():+.1f} a {tsm_hoy.anom_1991_2020.max():+.1f} °C.",
-        f"**El Niño global:** RONI {ult_roni.temporada} {ult_roni.roni:+.2f}" + (f" (1997 en el mismo trimestre: {v97:+.2f})." if v97 is not None else "."),
-        "**Lluvia:** " + ("; ".join(f"{z} con {q.futuro:.0f} mm previstos en 7 días (prob. {q.prob:.0f}%)" for z, q in vig.iterrows())
-                          + " — sobre la referencia de 30 mm." if not vig.empty else "ninguna cuenca alta supera la referencia de 30 mm."),
-    ]
-    for l in lineas:
-        st.markdown("- " + l)
-
 st.divider()
-st.caption("Fuentes: ENFEN/NOAA ERSSTv5 (ICEN) · NOAA CPC (regiones Niño, RONI) · NOAA OISST vía NCEI (mar) · Open-Meteo, CC BY 4.0 (pronóstico) · "
-           "NASA GPM IMERG (satélite) · SENAMHI NT 001-2014 (umbrales) · INDECI vía CENEPRED 2017 (eventos)")
+st.caption("Fuentes: IGP/ENFEN (ICEN oficial) · ENFEN (comunicados oficiales) · NOAA CPC (regiones Niño, RONI; calor 0-300 m, GODAS) · "
+           "NOAA ERSSTv5 (anomalía mensual Niño 1+2 hasta jul-2026) · NOAA OISST vía NCEI (mar) · Open-Meteo, CC BY 4.0 (pronóstico) · "
+           "NASA GPM IMERG (satélite) · SENAMHI NT 001-2014 (umbrales) · SENAMHI (nowcasting, hidrología) · INDECI vía CENEPRED 2017 (eventos)")
