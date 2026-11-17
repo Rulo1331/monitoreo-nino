@@ -19,19 +19,19 @@ jobs:
       # Nombres configurables desde Settings > Secrets and variables > Actions > Variables
       # (si la variable no existe, se usa el valor por defecto)
       BQ_DATASET: ${{ vars.BQ_DATASET || 'monitoreo_nino' }}
-      BQ_TABLA_ICEN: ${{ vars.BQ_TABLA_ICEN || 'icen' }}
-      BQ_TABLA_SEMANAL: ${{ vars.BQ_TABLA_SEMANAL || 'nino_semanal' }}
-      BQ_TABLA_RONI: ${{ vars.BQ_TABLA_RONI || 'roni' }}
-      BQ_TABLA_TSM: ${{ vars.BQ_TABLA_TSM || 'tsm_costera' }}
-      BQ_TABLA_TSM_CLIMA: ${{ vars.BQ_TABLA_TSM_CLIMA || 'tsm_costera_clima' }}
-      BQ_TABLA_LLUVIA: ${{ vars.BQ_TABLA_LLUVIA || 'lluvia_zonas' }}
-      BQ_TABLA_LLUVIA_PUNTOS: ${{ vars.BQ_TABLA_LLUVIA_PUNTOS || 'lluvia_puntos' }}
-      BQ_TABLA_LLUVIA_UMBRALES: ${{ vars.BQ_TABLA_LLUVIA_UMBRALES || 'lluvia_umbrales' }}
-      BQ_TABLA_EVENTOS: ${{ vars.BQ_TABLA_EVENTOS || 'eventos_historicos' }}
-      BQ_TABLA_LLUVIA_SAT: ${{ vars.BQ_TABLA_LLUVIA_SAT || 'lluvia_satelite' }}
-      BQ_TABLA_LLUVIA_CONTRASTE: ${{ vars.BQ_TABLA_LLUVIA_CONTRASTE || 'lluvia_contraste' }}
-      BQ_TABLA_EVENTOS_SAT: ${{ vars.BQ_TABLA_EVENTOS_SAT || 'eventos_satelite' }}
-      BQ_TABLA_CALOR: ${{ vars.BQ_TABLA_CALOR || 'calor_subsuperficial' }}
+      BQ_TABLA_ICEN: ${{ vars.BQ_TABLA_ICEN || 'fen_7_icen' }}
+      BQ_TABLA_SEMANAL: ${{ vars.BQ_TABLA_SEMANAL || 'fen_7_nino_semanal' }}
+      BQ_TABLA_RONI: ${{ vars.BQ_TABLA_RONI || 'fen_7_roni' }}
+      BQ_TABLA_TSM: ${{ vars.BQ_TABLA_TSM || 'fen_7_tsm_costera' }}
+      BQ_TABLA_TSM_CLIMA: ${{ vars.BQ_TABLA_TSM_CLIMA || 'fen_7_tsm_costera_clima' }}
+      BQ_TABLA_LLUVIA: ${{ vars.BQ_TABLA_LLUVIA || 'fen_7_lluvia_zonas' }}
+      BQ_TABLA_LLUVIA_PUNTOS: ${{ vars.BQ_TABLA_LLUVIA_PUNTOS || 'fen_7_lluvia_puntos' }}
+      BQ_TABLA_LLUVIA_UMBRALES: ${{ vars.BQ_TABLA_LLUVIA_UMBRALES || 'fen_7_lluvia_umbrales' }}
+      BQ_TABLA_EVENTOS: ${{ vars.BQ_TABLA_EVENTOS || 'fen_7_eventos_historicos' }}
+      BQ_TABLA_LLUVIA_SAT: ${{ vars.BQ_TABLA_LLUVIA_SAT || 'fen_7_lluvia_satelite' }}
+      BQ_TABLA_LLUVIA_CONTRASTE: ${{ vars.BQ_TABLA_LLUVIA_CONTRASTE || 'fen_7_lluvia_contraste' }}
+      BQ_TABLA_EVENTOS_SAT: ${{ vars.BQ_TABLA_EVENTOS_SAT || 'fen_7_eventos_satelite' }}
+      BQ_TABLA_CALOR: ${{ vars.BQ_TABLA_CALOR || 'fen_7_calor_subsuperficial' }}
       EARTHDATA_USER: ${{ secrets.EARTHDATA_USER }}
       EARTHDATA_PASS: ${{ secrets.EARTHDATA_PASS }}
       OPEN_METEO_API_KEY: ${{ secrets.OPEN_METEO_API_KEY }}   # vacío = plan gratuito (prueba)
