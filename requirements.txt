@@ -1,8 +1,10 @@
-streamlit[pdf]
+requests
 pandas
 numpy
-requests
 google-cloud-bigquery[pandas]
-plotly
-folium
-streamlit-folium
+netCDF4
+earthaccess
+xarray
+h5netcdf
+h5py
+pypdf
