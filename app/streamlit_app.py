@@ -284,6 +284,12 @@ def pdf_bytes(url):
     return r.content
 
 
+def enlace_publico(url):
+    """Enlace directo al PDF, sin la página de GitHub: el CDN público jsDelivr sirve el archivo tal cual
+    (https://cdn.jsdelivr.net/gh/<usuario>/<repo>@<rama>/<ruta>), y el navegador lo abre con su visor de PDF."""
+    return re.sub(r"^https://github\.com/([^/]+/[^/]+)/blob/([^/]+)/", r"https://cdn.jsdelivr.net/gh/\1@\2/", url)
+
+
 def ver_pdf(comunicado, url):
     """Abre el comunicado en una ventana emergente dentro del dashboard."""
     @st.dialog(f"Comunicado oficial ENFEN N° {comunicado}", width="large")
@@ -291,8 +297,8 @@ def ver_pdf(comunicado, url):
         try:
             st.pdf(pdf_bytes(url), height=720)
         except Exception as e:      # sin conexión a GitHub o sin el visor instalado: queda el enlace
-            st.warning(f"No se pudo mostrar el PDF aquí ({type(e).__name__}).")
-        st.link_button("Abrir en una pestaña nueva", url)
+            st.warning(f"No se pudo mostrar el PDF aquí: {str(e)[:160] or type(e).__name__}")
+        st.link_button("Abrir en una pestaña nueva", enlace_publico(url))
     _ventana()
 
 
@@ -523,7 +529,9 @@ with v_llu:
     emision_nc, datos_nc, error_nc = nowcasting(os.getenv("NODERED_URL"), os.getenv("NODERED_TOKEN"))
     geo_nc = None
     if emision_nc is None:
-        st.warning(f"Aviso de SENAMHI no disponible: {error_nc}.")
+        # Mientras el aviso no llegue al dashboard se muestra un mensaje amable (el detalle técnico queda en el log).
+        print(f"[nowcasting] no disponible: {error_nc}")
+        st.info("🛠️ Estamos preparando este espacio: pronto verás aquí el aviso de lluvia de SENAMHI en tiempo real.")
     else:
         from datetime import datetime as _dt
         atraso = (_dt.now(SN.LIMA).replace(tzinfo=None) - emision_nc).total_seconds() / 60
@@ -635,17 +643,23 @@ with v_oce:
         if sem.empty:
             st.info("Sin datos semanales (tabla nino_semanal).")
         else:
-            u = sem[sem.semana >= sem.semana.max() - pd.Timedelta(weeks=26)]
+            PERIODOS = {"6 meses": 26, "1 año": 52, "3 años": 156, "Desde 1990": None}
+            periodo = st.session_state.get("periodo_semanal") or "6 meses"
+            semanas = PERIODOS[periodo]
+            u = sem if semanas is None else sem[sem.semana >= sem.semana.max() - pd.Timedelta(weeks=semanas)]
+            modo_l = "lines+markers" if len(u) <= 60 else "lines"
             fig = go.Figure()
-            fig.add_scatter(x=u.semana, y=u.anom_nino12, name="Niño 1+2 (costa)", mode="lines+markers", line=dict(color=ROJO, width=3))
-            fig.add_scatter(x=u.semana, y=u.anom_nino34, name="Niño 3.4 (Pacífico central)", mode="lines+markers", line=dict(color=AZUL, width=2))
+            fig.add_scatter(x=u.semana, y=u.anom_nino12, name="Niño 1+2 (costa)", mode=modo_l, line=dict(color=ROJO, width=3 if len(u) <= 60 else 1.5))
+            fig.add_scatter(x=u.semana, y=u.anom_nino34, name="Niño 3.4 (Pacífico central)", mode=modo_l, line=dict(color=AZUL, width=2 if len(u) <= 60 else 1.2))
             fig.add_hline(y=0, line_color=GRIS)
             for col_s, color in (("anom_nino12", ROJO), ("anom_nino34", AZUL)):
                 fig.add_annotation(x=u.semana.iloc[-1], y=u[col_s].iloc[-1], text=f"{u[col_s].iloc[-1]:+.1f}", showarrow=False,
                                    xanchor="left", xshift=8, font=dict(color=color, size=13))
-            st.markdown(f"**Anomalía semanal del mar · últimos 6 meses** · Niño 1+2 {tend_sem}"
-                        + (f" ({dif_sem:+.2f} °C frente a las 4 semanas previas)" if dif_sem is not None else ""))
+            st.markdown(f"**Anomalía semanal del mar · {periodo.lower() if semanas else 'desde 1990'}**")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Semana", "Anomalía (°C)"))
+            st.segmented_control("Periodo", list(PERIODOS), default="6 meses", key="periodo_semanal", label_visibility="collapsed")
+            st.caption(f"Niño 1+2 {tend_sem} en la última semana"
+                       + (f" ({dif_sem:+.2f} °C frente al promedio de las 4 semanas previas)." if dif_sem is not None else "."))
     with o2:
         rec = anom_mes[anom_mes.fecha >= anom_mes.fecha.max() - pd.DateOffset(months=15)]
         fig = go.Figure()
@@ -681,8 +695,8 @@ with v_oce:
             st.markdown("**Anomalía de temperatura de los primeros 300 m · últimos 3 años**")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía 0-300 m (°C)"))
         with c2:
-            anios = st.multiselect("Comparar con", [a for a in (1982, 1997, 2015, 2017, 2023) if a in set(cal.anio)],
-                                   default=[a for a in (1997, 2015, 2023) if a in set(cal.anio)])
+            opciones = [a for a in (1982, 1997, 2015, 2017, 2023) if a in set(cal.anio)]
+            anios = st.session_state.get("anios_calor", [a for a in (1997, 2015, 2023) if a in opciones])
             fig = go.Figure()
             act = int(cal.anio.max())
             for a in anios + [act]:
@@ -693,6 +707,7 @@ with v_oce:
             fig.add_hline(y=0, line_color=GRIS)
             st.markdown(f"**{act} frente a otros años · franja 180°-100°O**")
             st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Mes", "Anomalía 0-300 m (°C)"))
+            st.multiselect("Comparar con", opciones, default=[a for a in (1997, 2015, 2023) if a in opciones], key="anios_calor")
         st.caption("Es la reserva de calor que las ondas Kelvin llevan hacia la costa: suele adelantarse 1 a 3 meses a lo que luego "
                    "aparece en la superficie. Fuente: NOAA CPC, análisis GODAS, climatología 1981-2010.")
 
@@ -737,12 +752,14 @@ with v_oce:
 
     o6, o7 = st.columns(2)
     with o6:
-        punto = st.selectbox("Serie diaria del puerto", orden, index=orden.index("Salaverry"))
+        punto = st.session_state.get("puerto_serie") or "Salaverry"
+        st.markdown(f"**Temperatura del mar frente a {punto} · último año**")
         s = tsm[(tsm.punto == punto) & (tsm.fecha >= ult_dia - pd.Timedelta(days=365))].sort_values("fecha")
         fig = go.Figure()
         fig.add_scatter(x=s.fecha, y=s.sst_clima, name="Normal 1991–2020", line=dict(color=AZUL, width=2))
         fig.add_scatter(x=s.fecha, y=s.sst, name="Observada", line=dict(color=ROJO, width=2), fill="tonexty", fillcolor="rgba(240,107,79,0.25)")
         st.plotly_chart(width="stretch", figure_or_data=estilo(fig, "Fecha", "Temperatura del mar (°C)"))
+        st.selectbox("Puerto", orden, index=orden.index("Salaverry"), key="puerto_serie")
     with o7:
         if not sem.empty:
             u = sem.tail(8)
