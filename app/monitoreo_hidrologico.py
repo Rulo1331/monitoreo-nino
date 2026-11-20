@@ -59,10 +59,23 @@ def _limpiar(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["valor", "umbral_amarillo", "umbral_naranja", "umbral_rojo"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     v, a, n, r = df["valor"], df["umbral_amarillo"], df["umbral_naranja"], df["umbral_rojo"]
+    # Umbrales de ESTIAJE (nivel bajo): SENAMHI los publica en orden inverso (rojo < naranja < amarillo),
+    # p. ej. Borja en el Marañón. Ahí la alerta se activa cuando el valor BAJA del umbral, no cuando lo supera.
+    primero = a.fillna(n).fillna(r)
+    ultimo = r.fillna(n).fillna(a)
+    df["estiaje"] = (primero.notna() & ultimo.notna() & (ultimo < primero)).astype(bool)
+    e = df["estiaje"]
+    crecida = [r.notna() & (v >= r), n.notna() & (v >= n), a.notna() & (v >= a)]
+    bajo = [r.notna() & (v <= r), n.notna() & (v <= n), a.notna() & (v <= a)]
     df["nivel_alerta"] = np.select(
-        [a.isna() & n.isna() & r.isna(), r.notna() & (v >= r), n.notna() & (v >= n), a.notna() & (v >= a)],
+        [a.isna() & n.isna() & r.isna()] + [np.where(e, b, c) for c, b in zip(crecida, bajo)],
         ["SIN_UMBRAL", "ROJO", "NARANJA", "AMARILLO"], "NORMAL")
     return df
+
+
+def _num(v):
+    """Formato de umbrales: sin decimales para caudales grandes, con 2 para niveles en m.s.n.m."""
+    return f"{v:,.0f}" if abs(v) >= 1000 or float(v).is_integer() else f"{v:,.2f}"
 
 
 @st.cache_data(ttl=600, show_spinner="Leyendo estaciones hidrológicas...")
@@ -135,7 +148,8 @@ def _tabla_estado(ult, hist):
     t = t.merge(huecos.rename("hueco_h").reset_index(), on=["cod_estacion", "variable"], how="left")
     t["limite_h"] = (t["hueco_h"].fillna(2) * 1.5).clip(lower=3)
     t["al_dia"] = t["antiguedad_h"] <= t["limite_h"]
-    t["pct_amarillo"] = (t["valor"] / t["umbral_amarillo"] * 100).where(t["umbral_amarillo"] > 0)
+    # El % del amarillo solo tiene sentido en umbrales de crecida (en estiaje la alerta es por debajo)
+    t["pct_amarillo"] = (t["valor"] / t["umbral_amarillo"] * 100).where((t["umbral_amarillo"] > 0) & ~t["estiaje"])
     t["orden"] = t["nivel_alerta"].map(ORDEN_ALERTA).fillna(9)
     return t.sort_values(["orden", "pct_amarillo", "estacion"], ascending=[True, False, True])
 
@@ -167,12 +181,13 @@ def _estado(t):
                      f"<div style='font-size:12px'>{detalle}</div></div>", unsafe_allow_html=True)
 
     if len(alertas):
-        st.warning("Superan un umbral de alerta de SENAMHI: " + "; ".join(
+        st.warning("En alerta según los umbrales de SENAMHI: " + "; ".join(
             f"**{r.estacion}** ({r.rio.title()}) {VARIABLES.get(r.variable, r.variable).lower()} {r.valor:,.2f} {r.unidad} "
-            f"→ {ETIQUETA_ALERTA[r.nivel_alerta]}" for r in alertas.itertuples()))
+            f"→ {ETIQUETA_ALERTA[r.nivel_alerta]}{' por nivel bajo (estiaje)' if r.estiaje else ''}"
+            for r in alertas.itertuples()))
 
     st.dataframe(pd.DataFrame({
-        "Alerta": t["nivel_alerta"].map(ETIQUETA_ALERTA),
+        "Alerta": t["nivel_alerta"].map(ETIQUETA_ALERTA) + np.where(t["estiaje"], " · estiaje", ""),
         "Estación": t["estacion"], "Río": t["rio"], "Departamento": t["departamento"],
         "Variable": t["variable"].map(VARIABLES), "Último valor": t["valor"], "Unidad": t["unidad"],
         "% del umbral amarillo": t["pct_amarillo"].clip(upper=100),
@@ -189,7 +204,7 @@ def _estado(t):
 
 def _hidrograma(ult, hist, dias):
     est = (ult.assign(o=ult["nivel_alerta"].map(ORDEN_ALERTA).fillna(9),
-                      p=(ult["valor"] / ult["umbral_amarillo"]).where(ult["umbral_amarillo"] > 0).fillna(-1))
+                      p=(ult["valor"] / ult["umbral_amarillo"]).where((ult["umbral_amarillo"] > 0) & ~ult["estiaje"]).fillna(-1))
               .sort_values(["o", "p"], ascending=[True, False]).drop_duplicates("cod_estacion"))
     etq = dict(zip(est["cod_estacion"], est.apply(_etiqueta, axis=1)))
 
@@ -221,11 +236,16 @@ def _hidrograma(ult, hist, dias):
                 [("Amarillo", "umbral_amarillo"), ("Naranja", "umbral_naranja"), ("Rojo", "umbral_rojo")] if s[c].notna().any()}
     # Las líneas de umbral se muestran por defecto solo si el río está a ≥30 % del amarillo:
     # así la serie no queda aplastada contra el eje (como pasa en la web de SENAMHI).
-    if umbrales:
+    if umbrales and bool(ult_f.get("estiaje", False)):
+        # Umbrales de nivel bajo: están en el mismo rango que la serie, se muestran siempre
+        mostrar = st.toggle("Mostrar umbrales de alerta", value=True, key=f"hidro_umb_{cod}_{var}")
+        st.caption("Umbrales de **estiaje** (alerta cuando el nivel baja de ellos): "
+                   + " · ".join(f"{n} {_num(v)} {unidad}" for n, v in umbrales.items()))
+    elif umbrales:
         ref = umbrales.get("Amarillo", min(umbrales.values()))
         mostrar = st.toggle("Mostrar umbrales de alerta", value=s["valor"].max() >= 0.3 * ref, key=f"hidro_umb_{cod}_{var}")
         if not mostrar:
-            st.caption("Umbrales SENAMHI: " + " · ".join(f"{n} {v:,.0f} {unidad}" for n, v in umbrales.items())
+            st.caption("Umbrales SENAMHI: " + " · ".join(f"{n} {_num(v)} {unidad}" for n, v in umbrales.items())
                        + f". El valor actual es el {ult_f['valor'] / ref * 100:.0f} % del amarillo.")
     else:
         mostrar = False
@@ -237,7 +257,7 @@ def _hidrograma(ult, hist, dias):
                     hovertemplate="%{x|%d/%m/%Y %H:%M}<br>%{y:,.2f} " + unidad + "<extra></extra>")
     if mostrar:
         for n, v in umbrales.items():
-            fig.add_hline(y=v, line_color=COLOR_UMBRAL[n], line_dash="dash", annotation_text=f"{n} {v:,.0f}",
+            fig.add_hline(y=v, line_color=COLOR_UMBRAL[n], line_dash="dash", annotation_text=f"{n} {_num(v)}",
                           annotation_font_color=COLOR_UMBRAL[n], annotation_position="top left")
     fig.update_layout(showlegend=False)
     st.markdown(f"**Hidrograma de {nombre.lower()}: {ult_f['estacion'].title()}, {ult_f['rio'].title()}**")
@@ -292,7 +312,7 @@ def _comparacion(ult, hist, dias, cod_sel, var):
 # ------------------------------------------------------------------ pestaña
 def render_monitoreo_hidrologico(cliente_fn=None):
     proyecto, dataset = _destino()
-    st.markdown("**Nivel y caudal de los ríos de la costa norte** · estaciones SENAMHI, recolectadas por Node-RED cada hora")
+    st.markdown("**Nivel y caudal de los ríos del norte del Perú** · estaciones SENAMHI, recolectadas por Node-RED cada hora")
 
     c1, c2, c3 = st.columns([1.3, 3, 0.8])
     periodo = c1.selectbox("Período", list(PERIODOS), index=2, key="hidro_periodo")
