@@ -41,6 +41,9 @@ VISTA, VISTA_ULTIMO = PREFIJO + "v_senamhi_hidrologia", PREFIJO + "v_senamhi_hid
 TZ = "America/Lima"
 PERIODOS = {"Últimas 24 h": 1, "Últimos 3 días": 3, "Últimos 7 días": 7, "Últimos 30 días": 30, "Últimos 90 días": 90}
 VARIABLES = {"CAUDAL": "Caudal", "NIVEL": "Nivel"}
+# Departamentos que no se marcan al abrir la pestaña (siguen en la lista y en la base de datos).
+# Loreto: sus alertas son por estiaje (nivel bajo) y pueden confundirse con crecidas.
+DEPTOS_NO_MARCADOS = {"LORETO"}
 ORDEN_ALERTA = {"ROJO": 0, "NARANJA": 1, "AMARILLO": 2, "NORMAL": 3, "SIN_UMBRAL": 4}
 ETIQUETA_ALERTA = {"ROJO": "🔴 Rojo", "NARANJA": "🟠 Naranja", "AMARILLO": "🟡 Amarillo",
                    "NORMAL": "🟢 Normal", "SIN_UMBRAL": "⚪ Sin umbral"}
@@ -331,7 +334,8 @@ def render_monitoreo_hidrologico(cliente_fn=None):
         return
 
     deptos = sorted(ult["departamento"].dropna().unique())
-    sel = c2.multiselect("Departamento", deptos, default=deptos, key="hidro_deptos")
+    defecto = [d for d in deptos if str(d).strip().upper() not in DEPTOS_NO_MARCADOS] or deptos
+    sel = c2.multiselect("Departamento", deptos, default=defecto, key="hidro_deptos")
     if not sel:
         st.info("Elige al menos un departamento.")
         return
