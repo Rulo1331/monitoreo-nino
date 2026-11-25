@@ -18,6 +18,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from monitoreo_hidrologico import render_monitoreo_hidrologico
+from avisos_precipitacion import render_avisos_precipitacion
 st.set_page_config(page_title="Monitoreo El Niño – Virú y Chao", page_icon="🌊", layout="wide")
 
 # ------------------------------------------------------------------ Configuración y datos
@@ -272,7 +273,7 @@ st.caption(" · ".join(x for x in [
     f"Lluvia emitida {ult_em}"] if x))
 
 # "Monitoreo hidrológico" va primero: st.tabs abre siempre la primera pestaña (vista inicial del dashboard)
-v_hid, v_pan, v_oce, v_llu = st.tabs(["Monitoreo hidrológico", "Panorama", "Océano", "Lluvia"])
+v_hid, v_pan, v_oce, v_llu, v_avi = st.tabs(["Monitoreo hidrológico", "Panorama", "Océano", "Lluvia", "Avisos precipitación"])
 
 # ================================================================== PANORAMA (situación actual + comparación con años anteriores)
 @st.cache_data(ttl=86400, show_spinner="Descargando el PDF...")
@@ -776,6 +777,10 @@ with v_oce:
 with v_hid:
     render_monitoreo_hidrologico(cliente_fn=lambda: L.cliente_bigquery(os.getenv("BQ_PROYECTO")))
 
+# ================================================================== AVISOS DE PRECIPITACIÓN (SENAMHI, carga manual)
+with v_avi:
+    render_avisos_precipitacion(capas_base=capas_base, zonas=L.ZONAS)
+
 
 # ================================================================== PENDIENTES (código guardado, no se muestra)
 # Se decidirá al final si vuelven al dashboard. Para mostrarlos, llamar a la función dentro de una pestaña.
@@ -842,4 +847,4 @@ def emergencias_indeci():
 st.divider()
 st.caption("Fuentes: IGP/ENFEN (ICEN oficial) · ENFEN (comunicados oficiales) · NOAA CPC (regiones Niño, RONI; calor 0-300 m, GODAS) · "
            "NOAA ERSSTv5 (anomalía mensual Niño 1+2 hasta jul-2026) · NOAA OISST vía NCEI (mar) · Open-Meteo, CC BY 4.0 (pronóstico) · "
-           "NASA GPM IMERG (satélite) · SENAMHI NT 001-2014 (umbrales) · SENAMHI (nowcasting, hidrología) · INDECI vía CENEPRED 2017 (eventos)")
+           "NASA GPM IMERG (satélite) · SENAMHI NT 001-2014 (umbrales) · SENAMHI (nowcasting, hidrología, avisos meteorológicos) · INEI vía peru-geojson (límites) · INDECI vía CENEPRED 2017 (eventos)")

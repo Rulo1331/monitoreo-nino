@@ -1,0 +1,299 @@
+"""
+Pestaña "Avisos precipitación" del dashboard El Niño — avisos meteorológicos de SENAMHI cargados a mano.
+
+Origen: el zip (shapefile) que se descarga desde la página del aviso en SENAMHI. Cada zip es UN mapa
+(un día) del aviso:  shp_aviso_<aviso>_<mapa>_<año>.zip  →  se suben a datos/avisos_senamhi/
+El número de aviso, el mapa, las fechas y los niveles se leen del propio shapefile (no del nombre del archivo).
+Opcional: datos/avisos_senamhi/avisos.csv con el título y la descripción de cada aviso.
+
+Uso en streamlit_app.py:
+    with v_avi:
+        render_avisos_precipitacion(capas_base=capas_base, zonas=L.ZONAS)
+
+Peso: el zip original tiene ~87 mil vértices; aquí se simplifica a ~550 m (TOLERANCIA) y solo se dibujan
+los niveles 2 a 4 del día elegido. Todo queda en caché hasta que cambien los archivos de la carpeta.
+"""
+import json
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import streamlit as st
+
+# ------------------------------------------------------------------ configuración
+RAIZ = Path(__file__).resolve().parents[1]
+CARPETA = RAIZ / "datos" / "avisos_senamhi"
+TITULOS = CARPETA / "avisos.csv"
+LIMITES = RAIZ / "datos" / "limites"
+LIMA = ZoneInfo("America/Lima")
+
+TOLERANCIA = 0.005          # grados (~550 m): simplificación de los polígonos del aviso
+MAX_BOTONES = 6             # avisos visibles como botones; el resto va en "Anteriores"
+# Departamentos que muestran provincias y distritos (los límites departamentales se ven en todo el Perú).
+DETALLE_POR_DEFECTO = ["LA LIBERTAD", "ANCASH"]
+
+# Niveles del aviso meteorológico de SENAMHI (mismos colores que el nowcasting de la pestaña Lluvia)
+NIVELES = {1: ("Verde", "#3FAE5A"), 2: ("Amarillo", "#FFE600"), 3: ("Naranja", "#FF9900"), 4: ("Rojo", "#E60000")}
+CUADRO = {0: "⬜", 1: "🟩", 2: "🟨", 3: "🟧", 4: "🟥"}
+ENCUADRES = {"La Libertad": ([-8.1, -78.4], 8), "Costa norte": ([-7.0, -79.0], 6), "Perú": ([-9.3, -75.0], 5)}
+DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "set", "oct", "nov", "dic"]
+
+# estilo del dashboard
+FONDO, PANEL, LINEA, TEXTO, GRIS = "#0C141C", "#131E28", "#22313F", "#E6EDF3", "#9FB0C0"
+
+
+def _fecha(d):
+    return f"{DIAS[d.weekday()]} {d.day} {MESES[d.month - 1]}"
+
+
+def _nivel(texto):
+    """'Nivel 3' -> 3"""
+    m = re.search(r"\d", str(texto))
+    return int(m.group()) if m else 0
+
+
+def _texto_color(n):
+    return "#FFFFFF" if n in (1, 4) else FONDO
+
+
+# ------------------------------------------------------------------ lectura (con caché)
+def _firma():
+    """Lista de zips con tamaño y fecha: si se sube o cambia uno, la caché se renueva."""
+    if not CARPETA.exists():
+        return ()
+    return tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(CARPETA.glob("*.zip")))
+
+
+def _leer_zip(ruta, zonas):
+    """Un zip = un mapa (día). Devuelve sus datos, el GeoJSON simplificado (niveles 2-4) y el nivel por zona."""
+    import shapefile                       # pyshp: lee el zip directamente, sin GDAL
+    import shapely
+    from shapely.geometry import Polygon, mapping, shape
+
+    r = shapefile.Reader(str(ruta), encoding="latin-1")
+    filas = []
+    for sr in r.iterShapeRecords():
+        a = sr.record.as_dict()
+        filas.append((a, shape(sr.shape.__geo_interface__)))
+    if not filas:
+        raise ValueError("el shapefile no tiene polígonos")
+    a0 = filas[0][0]
+
+    features, por_zona = [], {}
+    for a, geom in filas:
+        n = _nivel(a.get("nivel"))
+        if n >= 2:      # el nivel 1 cubre el resto del país: no se dibuja (como en la web de SENAMHI)
+            g = shapely.set_precision(geom.simplify(TOLERANCIA, preserve_topology=True), 0.0001)
+            features.append({"type": "Feature", "geometry": mapping(g),
+                             "properties": {"nivel": n, "texto": f"Nivel {n} · {NIVELES[n][0]}"}})
+        for nombre, poligono in zonas:      # nivel más alto que toca al menos parte de la zona
+            if geom.intersects(Polygon([(lon, lat) for lat, lon in poligono])):
+                por_zona[nombre] = max(por_zona.get(nombre, 0), n)
+
+    return {
+        "aviso": int(a0["nro_aviso"]), "mapa": int(a0["nro_mapa"]), "anio": a0["fecha_emi"].year,
+        "emision": a0["fecha_emi"], "inicio": min(a["fech_ini"] for a, _ in filas),
+        "fin": max(a["fech_fin"] for a, _ in filas), "nivel_max": max(_nivel(a.get("nivel")) for a, _ in filas),
+        "geojson": json.dumps({"type": "FeatureCollection", "features": features}, separators=(",", ":")),
+        "zonas": por_zona, "archivo": ruta.name,
+    }
+
+
+@st.cache_data(show_spinner="Leyendo los avisos de SENAMHI...")
+def cargar(firma, zonas):
+    """Agrupa los mapas por aviso. Devuelve (avisos del más reciente al más antiguo, archivos con error)."""
+    mapas, errores = {}, []
+    for nombre, _, _ in firma:
+        try:
+            m = _leer_zip(CARPETA / nombre, zonas)
+        except Exception as e:      # zip dañado o que no es un aviso: se informa y se sigue con los demás
+            print(f"[avisos] no se pudo leer {nombre}: {type(e).__name__}: {e}")
+            errores.append(nombre)
+            continue
+        mapas[(m["anio"], m["aviso"], m["mapa"])] = m      # si un mapa se subió dos veces, queda uno
+
+    avisos = {}
+    for (anio, aviso, _), m in sorted(mapas.items()):
+        avisos.setdefault((anio, aviso), []).append(m)
+    salida = []
+    for (anio, aviso), ms in sorted(avisos.items(), reverse=True):
+        salida.append({"anio": anio, "aviso": aviso, "mapas": ms, "emision": max(m["emision"] for m in ms),
+                       "inicio": min(m["inicio"] for m in ms), "fin": max(m["fin"] for m in ms),
+                       "nivel_max": max(m["nivel_max"] for m in ms)})
+    return salida, errores
+
+
+@st.cache_data(show_spinner=False)
+def titulos(firma_csv):
+    """avisos.csv (opcional): aviso, anio, titulo, descripcion."""
+    if not firma_csv:
+        return {}
+    try:
+        t = pd.read_csv(TITULOS, dtype=str, keep_default_na=False)
+        return {(int(r.anio), int(r.aviso)): (r.get("titulo", ""), r.get("descripcion", "")) for _, r in t.iterrows()}
+    except Exception as e:
+        print(f"[avisos] avisos.csv no se pudo leer: {type(e).__name__}: {e}")
+        return {}
+
+
+@st.cache_data(show_spinner=False)
+def limites(nivel, departamentos=None):
+    """GeoJSON de límites (INEI) filtrado por departamento, para no enviar al navegador todo el país."""
+    ruta = LIMITES / f"{nivel}.geojson"
+    if not ruta.exists():
+        return None
+    d = json.loads(ruta.read_text(encoding="utf-8"))
+    if departamentos is not None:
+        d["features"] = [f for f in d["features"] if f["properties"].get("departamento") in departamentos]
+    return json.dumps(d, separators=(",", ":"))
+
+
+@st.cache_data(show_spinner=False)
+def departamentos_disponibles():
+    ruta = LIMITES / "provincias.geojson"
+    if not ruta.exists():
+        return []
+    return sorted({f["properties"]["departamento"] for f in json.loads(ruta.read_text(encoding="utf-8"))["features"]})
+
+
+# ------------------------------------------------------------------ piezas de la vista
+def _cabecera(a, titulo, hoy):
+    n = a["nivel_max"]
+    nombre, color = NIVELES.get(n, ("—", GRIS))
+    dias = (a["fin"] - a["inicio"]).days + 1
+    if hoy < a["inicio"]:
+        estado = f"Próximo · empieza en {(a['inicio'] - hoy).days} día(s)"
+    elif hoy > a["fin"]:
+        estado = "Finalizado"
+    else:
+        estado = f"Vigente · día {(hoy - a['inicio']).days + 1} de {dias}"
+    titulo_html = f"<div style='font-size:20px;font-weight:700;color:{color if n >= 2 else TEXTO};margin-top:6px'>{titulo}</div>" if titulo else ""
+    st.markdown(
+        f"<div style='background:{PANEL};border:1px solid {LINEA};border-left:6px solid {color};border-radius:10px;padding:12px 16px'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap'>"
+        f"<div style='font-size:22px;font-weight:700'>Aviso N° {a['aviso']}-{a['anio']}</div>"
+        f"<div style='background:{color};color:{_texto_color(n)};font-weight:700;padding:4px 14px;border-radius:6px'>{nombre.upper()}</div></div>"
+        f"{titulo_html}"
+        f"<div style='display:flex;gap:28px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:{GRIS}'>"
+        f"<span>Inicio: <b style='color:{TEXTO}'>{_fecha(a['inicio'])} 00:00</b></span>"
+        f"<span>Fin: <b style='color:{TEXTO}'>{_fecha(a['fin'])} 23:59</b></span>"
+        f"<span>Vigencia: <b style='color:{TEXTO}'>{dias * 24 - 1} horas</b></span>"
+        f"<span>Emisión: <b style='color:{TEXTO}'>{_fecha(a['emision'])}</b></span>"
+        f"<span>Estado: <b style='color:{TEXTO}'>{estado}</b></span></div></div>",
+        unsafe_allow_html=True)
+
+
+def _tabla_zonas(a, zonas, dia_sel):
+    """Nivel por zona de monitoreo (filas) y día (columnas)."""
+    th = f"padding:6px 8px;font-size:12px;color:{GRIS};text-align:center;border-bottom:1px solid {LINEA}"
+    cab = "".join(f"<th style='{th}{';color:' + TEXTO if m['mapa'] == dia_sel else ''}'>{_fecha(m['inicio'])}</th>" for m in a["mapas"])
+    filas = ""
+    for nombre, _ in zonas:
+        celdas = ""
+        for m in a["mapas"]:
+            n = m["zonas"].get(nombre, 0)
+            fondo = NIVELES[n][1] if n >= 2 else "transparent"
+            txt = _texto_color(n) if n >= 2 else GRIS
+            borde = f"outline:2px solid {TEXTO};" if m["mapa"] == dia_sel else ""
+            celdas += (f"<td style='padding:4px'><div style='background:{fondo};color:{txt};{borde}border:1px solid {LINEA};"
+                       f"border-radius:6px;text-align:center;font-size:12px;padding:4px 2px'>{'Nivel ' + str(n) if n else '—'}</div></td>")
+        filas += f"<tr><td style='padding:4px 8px;font-size:13px;white-space:nowrap'>{nombre}</td>{celdas}</tr>"
+    st.markdown(f"<table style='width:100%;border-collapse:collapse'><tr><th style='{th};text-align:left'>Zona</th>{cab}</tr>{filas}</table>",
+                unsafe_allow_html=True)
+    st.caption("Nivel más alto del aviso que toca al menos parte de la zona. Nivel 1 (verde) = sin aviso.")
+
+
+def _mapa(m_dia, zonas, encuadre, detalle, capas_base):
+    import folium
+    from streamlit_folium import st_folium
+
+    centro, zoom = ENCUADRES[encuadre]
+    mapa = folium.Map(location=centro, zoom_start=zoom, tiles=None, control_scale=True)
+    if capas_base:
+        capas_base(mapa, primero="oscuro")
+    else:
+        folium.TileLayer("OpenStreetMap").add_to(mapa)
+
+    g_av = folium.FeatureGroup("Aviso SENAMHI")
+    folium.GeoJson(m_dia["geojson"], style_function=lambda f: {
+        "fillColor": NIVELES[f["properties"]["nivel"]][1], "color": NIVELES[f["properties"]["nivel"]][1],
+        "weight": 1, "fillOpacity": 0.55}, tooltip=folium.GeoJsonTooltip(["texto"], labels=False)).add_to(g_av)
+    g_av.add_to(mapa)
+
+    g_z = folium.FeatureGroup("Zonas de monitoreo")
+    for nombre, poligono in zonas:
+        folium.Polygon(list(poligono), color="#FFFFFF", weight=1.5, dash_array="5", fill=False, tooltip=nombre).add_to(g_z)
+    g_z.add_to(mapa)
+
+    capas = [("departamentos", "Departamentos", None, 2.0, True, ["departamento"]),
+             ("provincias", "Provincias", detalle, 1.2, False, ["provincia", "departamento"]),
+             ("distritos", "Distritos", detalle, 0.6, False, ["distrito", "provincia"])]
+    for archivo, nombre, filtro, grosor, visible, campos in capas:
+        geo = limites(archivo, filtro)
+        if geo:
+            folium.GeoJson(geo, name=nombre, show=visible,
+                           style_function=lambda _, w=grosor: {"fill": False, "color": "#C9D4DF", "weight": w, "opacity": 0.8},
+                           tooltip=folium.GeoJsonTooltip(campos, labels=False)).add_to(mapa)
+
+    folium.LayerControl(collapsed=False).add_to(mapa)
+    st_folium(mapa, height=560, use_container_width=True, returned_objects=[])
+
+
+# ------------------------------------------------------------------ pestaña
+def render_avisos_precipitacion(capas_base=None, zonas=()):
+    zonas = tuple((z["zona"], tuple(map(tuple, z["poligono"]))) for z in zonas)
+    st.markdown("**Avisos meteorológicos de precipitación** · SENAMHI · mapas cargados a mano en `datos/avisos_senamhi`")
+
+    avisos, errores = cargar(_firma(), zonas)
+    if errores:
+        st.caption(f"⚠️ No se pudieron leer {len(errores)} archivo(s): {', '.join(errores)}. Revisa que sean los zip de SENAMHI.")
+    if not avisos:
+        st.info("Aún no hay avisos cargados. Sube los zip descargados de SENAMHI a `datos/avisos_senamhi` "
+                "(Add file → Upload files) y el dashboard los mostrará solos.")
+        return
+    hoy = datetime.now(LIMA).date()
+    textos = titulos(TITULOS.stat().st_mtime_ns if TITULOS.exists() else None)
+
+    # --- selector de aviso: los más recientes como botones, el resto en "Anteriores"
+    etiqueta = {f"{CUADRO.get(a['nivel_max'], '')} N° {a['aviso']}": a for a in avisos}
+    opciones = list(etiqueta)[:MAX_BOTONES] + (["Anteriores"] if len(avisos) > MAX_BOTONES else [])
+    elegido = st.segmented_control("Aviso", opciones, default=opciones[0], key="avisos_sel", label_visibility="collapsed")
+    if elegido == "Anteriores":
+        previos = list(etiqueta)[MAX_BOTONES:]
+        elegido = st.selectbox("Avisos anteriores", previos,
+                               format_func=lambda k: f"{k} · {_fecha(etiqueta[k]['inicio'])} a {_fecha(etiqueta[k]['fin'])}",
+                               key="avisos_previos")
+    a = etiqueta.get(elegido) or avisos[0]     # sin selección: el más reciente
+
+    titulo, descripcion = textos.get((a["anio"], a["aviso"]), ("", ""))
+    _cabecera(a, titulo, hoy)
+    if descripcion:
+        with st.expander("Descripción del aviso"):
+            st.write(descripcion)
+
+    # --- día (mapa) del aviso: por defecto hoy si está dentro del aviso
+    dia = {f"{CUADRO.get(m['nivel_max'], '')} {_fecha(m['inicio'])}": m for m in a["mapas"]}
+    por_defecto = next((k for k, m in dia.items() if m["inicio"] <= hoy <= m["fin"]), list(dia)[0])
+    c1, c2 = st.columns([3, 1.2], vertical_alignment="bottom")
+    k_dia = c1.segmented_control("Día", list(dia), default=por_defecto, key=f"avisos_dia_{a['anio']}_{a['aviso']}")
+    encuadre = c2.selectbox("Encuadre", list(ENCUADRES), key="avisos_encuadre")
+    m_dia = dia.get(k_dia) or dia[por_defecto]
+
+    col_mapa, col_panel = st.columns([1.7, 1])
+    with col_panel:
+        st.markdown("**Nivel en las zonas de monitoreo**")
+        _tabla_zonas(a, zonas, m_dia["mapa"])
+        deps = departamentos_disponibles()
+        detalle = DETALLE_POR_DEFECTO
+        if deps:
+            detalle = st.multiselect("Provincias y distritos de", deps, default=[d for d in DETALLE_POR_DEFECTO if d in deps],
+                                     format_func=str.title, key="avisos_detalle",
+                                     help="Solo se cargan los límites de estos departamentos, para que el mapa siga liviano.")
+        st.caption(f"Mapas cargados de este aviso: {len(a['mapas'])} · archivos: " + ", ".join(m["archivo"] for m in a["mapas"]))
+    with col_mapa:
+        _mapa(m_dia, zonas, encuadre, tuple(detalle), capas_base)
+        st.caption("Aviso: SENAMHI (simplificado a ~550 m) · Límites: INEI vía peru-geojson (MPL 2.0) · "
+                   "Activa provincias y distritos en el selector de capas del mapa.")

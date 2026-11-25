@@ -6,3 +6,5 @@ google-cloud-bigquery[pandas]
 plotly
 folium
 streamlit-folium
+pyshp
+shapely
