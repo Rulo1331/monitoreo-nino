@@ -37,7 +37,11 @@ DETALLE_POR_DEFECTO = ["LA LIBERTAD", "ANCASH"]
 # Niveles del aviso meteorológico de SENAMHI (mismos colores que el nowcasting de la pestaña Lluvia)
 NIVELES = {1: ("Verde", "#3FAE5A"), 2: ("Amarillo", "#FFE600"), 3: ("Naranja", "#FF9900"), 4: ("Rojo", "#E60000")}
 CUADRO = {0: "⬜", 1: "🟩", 2: "🟨", 3: "🟧", 4: "🟥"}
-ENCUADRES = {"La Libertad": ([-8.1, -78.4], 8), "Costa norte": ([-7.0, -79.0], 6), "Perú": ([-9.3, -75.0], 5)}
+# Regiones (departamentos) de la tabla de niveles, de norte a sur: nombre en el archivo de límites -> nombre a mostrar
+REGIONES = {"TUMBES": "Tumbes", "PIURA": "Piura", "LAMBAYEQUE": "Lambayeque", "LA LIBERTAD": "La Libertad",
+            "CAJAMARCA": "Cajamarca", "ANCASH": "Áncash", "LIMA": "Lima"}
+AREA_MINIMA = 0.002         # grados² (~25 km²): una franja menor no cuenta (evita bordes que apenas se tocan)
+CENTRO, ZOOM = [-8.2, -78.3], 6     # vista inicial: de Tumbes a Lima
 DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "set", "oct", "nov", "dic"]
 
@@ -67,11 +71,12 @@ def _firma():
     return tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(CARPETA.glob("*.zip")))
 
 
-def _leer_zip(ruta, zonas):
-    """Un zip = un mapa (día). Devuelve sus datos, el GeoJSON simplificado (niveles 2-4) y el nivel por zona."""
+def _leer_zip(ruta, regiones):
+    """Un zip = un mapa (día). Devuelve sus datos, el GeoJSON simplificado (niveles 2-4) y el nivel por región.
+    regiones: {nombre: polígono shapely del departamento}"""
     import shapefile                       # pyshp: lee el zip directamente, sin GDAL
     import shapely
-    from shapely.geometry import Polygon, mapping, shape
+    from shapely.geometry import mapping, shape
 
     r = shapefile.Reader(str(ruta), encoding="latin-1")
     filas = []
@@ -82,33 +87,41 @@ def _leer_zip(ruta, zonas):
         raise ValueError("el shapefile no tiene polígonos")
     a0 = filas[0][0]
 
-    features, por_zona = [], {}
+    features, por_region = [], {}
     for a, geom in filas:
         n = _nivel(a.get("nivel"))
         if n >= 2:      # el nivel 1 cubre el resto del país: no se dibuja (como en la web de SENAMHI)
             g = shapely.set_precision(geom.simplify(TOLERANCIA, preserve_topology=True), 0.0001)
             features.append({"type": "Feature", "geometry": mapping(g),
                              "properties": {"nivel": n, "texto": f"Nivel {n} · {NIVELES[n][0]}"}})
-        for nombre, poligono in zonas:      # nivel más alto que toca al menos parte de la zona
-            if geom.intersects(Polygon([(lon, lat) for lat, lon in poligono])):
-                por_zona[nombre] = max(por_zona.get(nombre, 0), n)
+        for nombre, dep in regiones.items():
+            area = geom.intersection(dep).area if geom.intersects(dep) else 0.0
+            if area < AREA_MINIMA:
+                continue
+            nivel_r, area_aviso = por_region.get(nombre, (0, 0.0))
+            por_region[nombre] = (max(nivel_r, n), area_aviso + (area if n >= 2 else 0.0))
+    # nivel más alto en la región y % de su área con aviso (nivel 2 o más)
+    por_region = {k: (n, min(100.0, 100 * ar / regiones[k].area)) for k, (n, ar) in por_region.items()}
 
     return {
         "aviso": int(a0["nro_aviso"]), "mapa": int(a0["nro_mapa"]), "anio": a0["fecha_emi"].year,
         "emision": a0["fecha_emi"], "inicio": min(a["fech_ini"] for a, _ in filas),
         "fin": max(a["fech_fin"] for a, _ in filas), "nivel_max": max(_nivel(a.get("nivel")) for a, _ in filas),
         "geojson": json.dumps({"type": "FeatureCollection", "features": features}, separators=(",", ":")),
-        "zonas": por_zona, "archivo": ruta.name,
+        "regiones": por_region, "archivo": ruta.name,
     }
 
 
 @st.cache_data(show_spinner="Leyendo los avisos de SENAMHI...")
-def cargar(firma, zonas):
+def cargar(firma, regiones):
     """Agrupa los mapas por aviso. Devuelve (avisos del más reciente al más antiguo, archivos con error)."""
+    from shapely.geometry import shape
+    geo = json.loads(limites("departamentos", regiones) or '{"features": []}')
+    poligonos = {f["properties"]["departamento"]: shape(f["geometry"]) for f in geo["features"]}
     mapas, errores = {}, []
     for nombre, _, _ in firma:
         try:
-            m = _leer_zip(CARPETA / nombre, zonas)
+            m = _leer_zip(CARPETA / nombre, poligonos)
         except Exception as e:      # zip dañado o que no es un aviso: se informa y se sigue con los demás
             print(f"[avisos] no se pudo leer {nombre}: {type(e).__name__}: {e}")
             errores.append(nombre)
@@ -186,32 +199,34 @@ def _cabecera(a, titulo, hoy):
         unsafe_allow_html=True)
 
 
-def _tabla_zonas(a, zonas, dia_sel):
-    """Nivel por zona de monitoreo (filas) y día (columnas)."""
+def _tabla_regiones(a, dia_sel):
+    """Nivel por región (filas) y día (columnas), con el % del área de la región con aviso."""
     th = f"padding:6px 8px;font-size:12px;color:{GRIS};text-align:center;border-bottom:1px solid {LINEA}"
     cab = "".join(f"<th style='{th}{';color:' + TEXTO if m['mapa'] == dia_sel else ''}'>{_fecha(m['inicio'])}</th>" for m in a["mapas"])
     filas = ""
-    for nombre, _ in zonas:
+    for clave, nombre in REGIONES.items():
         celdas = ""
         for m in a["mapas"]:
-            n = m["zonas"].get(nombre, 0)
+            n, pct = m["regiones"].get(clave, (0, 0.0))
             fondo = NIVELES[n][1] if n >= 2 else "transparent"
             txt = _texto_color(n) if n >= 2 else GRIS
             borde = f"outline:2px solid {TEXTO};" if m["mapa"] == dia_sel else ""
+            detalle = f"<div style='font-size:10px;opacity:.85'>{pct:.0f}% del área</div>" if n >= 2 else ""
             celdas += (f"<td style='padding:4px'><div style='background:{fondo};color:{txt};{borde}border:1px solid {LINEA};"
-                       f"border-radius:6px;text-align:center;font-size:12px;padding:4px 2px'>{'Nivel ' + str(n) if n else '—'}</div></td>")
+                       f"border-radius:6px;text-align:center;font-size:12px;padding:3px 2px;line-height:1.25'>"
+                       f"{'Nivel ' + str(n) if n else '—'}{detalle}</div></td>")
         filas += f"<tr><td style='padding:4px 8px;font-size:13px;white-space:nowrap'>{nombre}</td>{celdas}</tr>"
-    st.markdown(f"<table style='width:100%;border-collapse:collapse'><tr><th style='{th};text-align:left'>Zona</th>{cab}</tr>{filas}</table>",
+    st.markdown(f"<table style='width:100%;border-collapse:collapse'><tr><th style='{th};text-align:left'>Región</th>{cab}</tr>{filas}</table>",
                 unsafe_allow_html=True)
-    st.caption("Nivel más alto del aviso que toca al menos parte de la zona. Nivel 1 (verde) = sin aviso.")
+    st.caption("Nivel más alto del aviso dentro de la región y porcentaje de su área con aviso (nivel 2 o más). "
+               "Nivel 1 = sin aviso.")
 
 
-def _mapa(m_dia, zonas, encuadre, detalle, capas_base):
+def _mapa(m_dia, zonas, detalle, capas_base):
     import folium
     from streamlit_folium import st_folium
 
-    centro, zoom = ENCUADRES[encuadre]
-    mapa = folium.Map(location=centro, zoom_start=zoom, tiles=None, control_scale=True)
+    mapa = folium.Map(location=CENTRO, zoom_start=ZOOM, tiles=None, control_scale=True)
     if capas_base:
         capas_base(mapa, primero="oscuro")
     else:
@@ -228,14 +243,28 @@ def _mapa(m_dia, zonas, encuadre, detalle, capas_base):
         folium.Polygon(list(poligono), color="#FFFFFF", weight=1.5, dash_array="5", fill=False, tooltip=nombre).add_to(g_z)
     g_z.add_to(mapa)
 
-    capas = [("departamentos", "Departamentos", None, 2.0, True, ["departamento"]),
-             ("provincias", "Provincias", detalle, 1.2, False, ["provincia", "departamento"]),
-             ("distritos", "Distritos", detalle, 0.6, False, ["distrito", "provincia"])]
-    for archivo, nombre, filtro, grosor, visible, campos in capas:
+    # Departamentos en un panel propio, siempre por encima del aviso, provincias y distritos:
+    # línea oscura con un borde claro alrededor, para que se distinga sobre cualquier mapa base.
+    folium.map.CustomPane("limite_dep", z_index=450, pointer_events=True).add_to(mapa)
+    capas = [  # (archivo, nombre, filtro, estilo, visible, campos del tooltip)
+        ("departamentos", "Departamentos", None, None, True, ["departamento"]),
+        ("provincias", "Provincias", detalle, {"color": "#C9D4DF", "weight": 1.2, "opacity": 0.9}, False, ["provincia", "departamento"]),
+        ("distritos", "Distritos", detalle, {"color": "#9FB0C0", "weight": 0.7, "opacity": 0.8, "dashArray": "3 3"}, False, ["distrito", "provincia"]),
+    ]
+    for archivo, nombre, filtro, estilo, visible, campos in capas:
         geo = limites(archivo, filtro)
-        if geo:
-            folium.GeoJson(geo, name=nombre, show=visible,
-                           style_function=lambda _, w=grosor: {"fill": False, "color": "#C9D4DF", "weight": w, "opacity": 0.8},
+        if not geo:
+            continue
+        if archivo == "departamentos":
+            g_dep = folium.FeatureGroup(nombre, show=visible)
+            folium.GeoJson(geo, pane="limite_dep", interactive=False,
+                           style_function=lambda _: {"fill": False, "color": "#E6EDF3", "weight": 4.5, "opacity": 0.55}).add_to(g_dep)
+            folium.GeoJson(geo, pane="limite_dep",
+                           style_function=lambda _: {"fill": False, "color": "#0B0F14", "weight": 2.2, "opacity": 1},
+                           tooltip=folium.GeoJsonTooltip(campos, labels=False)).add_to(g_dep)
+            g_dep.add_to(mapa)
+        else:
+            folium.GeoJson(geo, name=nombre, show=visible, style_function=lambda _, e=estilo: {"fill": False, **e},
                            tooltip=folium.GeoJsonTooltip(campos, labels=False)).add_to(mapa)
 
     folium.LayerControl(collapsed=False).add_to(mapa)
@@ -247,7 +276,7 @@ def render_avisos_precipitacion(capas_base=None, zonas=()):
     zonas = tuple((z["zona"], tuple(map(tuple, z["poligono"]))) for z in zonas)
     st.markdown("**Avisos meteorológicos de precipitación** · SENAMHI")
 
-    avisos, errores = cargar(_firma(), zonas)
+    avisos, errores = cargar(_firma(), tuple(REGIONES))
     if errores:
         st.caption(f"⚠️ No se pudieron leer {len(errores)} archivo(s): {', '.join(errores)}. Revisa que sean los zip de SENAMHI.")
     if not avisos:
@@ -277,15 +306,13 @@ def render_avisos_precipitacion(capas_base=None, zonas=()):
     # --- día (mapa) del aviso: por defecto hoy si está dentro del aviso
     dia = {f"{CUADRO.get(m['nivel_max'], '')} {_fecha(m['inicio'])}": m for m in a["mapas"]}
     por_defecto = next((k for k, m in dia.items() if m["inicio"] <= hoy <= m["fin"]), list(dia)[0])
-    c1, c2 = st.columns([3, 1.2], vertical_alignment="bottom")
-    k_dia = c1.segmented_control("Día", list(dia), default=por_defecto, key=f"avisos_dia_{a['anio']}_{a['aviso']}")
-    encuadre = c2.selectbox("Encuadre", list(ENCUADRES), key="avisos_encuadre")
+    k_dia = st.segmented_control("Día", list(dia), default=por_defecto, key=f"avisos_dia_{a['anio']}_{a['aviso']}")
     m_dia = dia.get(k_dia) or dia[por_defecto]
 
     col_mapa, col_panel = st.columns([1.7, 1])
     with col_panel:
-        st.markdown("**Nivel en las zonas de monitoreo**")
-        _tabla_zonas(a, zonas, m_dia["mapa"])
+        st.markdown("**Nivel por región**")
+        _tabla_regiones(a, m_dia["mapa"])
         deps = departamentos_disponibles()
         detalle = DETALLE_POR_DEFECTO
         if deps:
@@ -294,6 +321,6 @@ def render_avisos_precipitacion(capas_base=None, zonas=()):
                                      help="Solo se cargan los límites de estos departamentos, para que el mapa siga liviano.")
         st.caption(f"Numero total de mapas cargados de este aviso: {len(a['mapas'])}" )
     with col_mapa:
-        _mapa(m_dia, zonas, encuadre, tuple(detalle), capas_base)
-        st.caption("Mapa de Aviso según SENAMHI (simplificado a ~550 m) || Límites según INEI"
+        _mapa(m_dia, zonas, tuple(detalle), capas_base)
+        st.caption("Mapa de Aviso según SENAMHI (simplificado a ~550 m) || Límites según INEI || "
                    "Activación de provincias y distritos en el selector de capas del mapa.")
