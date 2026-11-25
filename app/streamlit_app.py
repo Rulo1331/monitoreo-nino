@@ -273,7 +273,7 @@ st.caption(" · ".join(x for x in [
     f"Lluvia emitida {ult_em}"] if x))
 
 # "Monitoreo hidrológico" va primero: st.tabs abre siempre la primera pestaña (vista inicial del dashboard)
-v_hid, v_pan, v_oce, v_llu, v_avi = st.tabs(["Monitoreo hidrológico", "Panorama", "Océano", "Lluvia", "Avisos precipitación"])
+v_hid, v_avi, v_pan, v_oce, v_llu = st.tabs(["Monitoreo hidrológico", "Avisos precipitación", "Panorama", "Océano", "Lluvia"])
 
 # ================================================================== PANORAMA (situación actual + comparación con años anteriores)
 @st.cache_data(ttl=86400, show_spinner="Descargando el PDF...")

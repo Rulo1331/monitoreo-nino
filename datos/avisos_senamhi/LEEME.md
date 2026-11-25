@@ -12,3 +12,7 @@ Aquí van los zip que se descargan desde la página de cada aviso en SENAMHI
 - **No borres los avisos antiguos:** quedan como historial en "Anteriores".
 - **Título y descripción (opcional):** el shapefile no los trae. Si quieres verlos en el dashboard,
   agrega una fila en `avisos.csv` (columnas `aviso,anio,titulo,descripcion`). Si el texto tiene comas, va entre comillas.
+- **Lluvia prevista (opcional):** los acumulados por día del texto del aviso van en `rangos.csv`,
+  una fila por día y zona: `aviso,anio,fecha,zona,min_mm,max_mm` (fecha como `2026-11-24`).
+  - "entre 5 y 70 mm/día en la costa norte" → `481,2026,2026-11-24,Costa norte,5,70`
+  - "valores cercanos a 15 mm/día en la sierra sur" → `481,2026,2026-11-24,Sierra sur,,15` (mínimo vacío: se muestra "≈ 15")

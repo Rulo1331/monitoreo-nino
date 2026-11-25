@@ -4,7 +4,8 @@ Pestaña "Avisos precipitación" del dashboard El Niño — avisos meteorológic
 Origen: el zip (shapefile) que se descarga desde la página del aviso en SENAMHI. Cada zip es UN mapa
 (un día) del aviso:  shp_aviso_<aviso>_<mapa>_<año>.zip  →  se suben a datos/avisos_senamhi/
 El número de aviso, el mapa, las fechas y los niveles se leen del propio shapefile (no del nombre del archivo).
-Opcional: datos/avisos_senamhi/avisos.csv con el título y la descripción de cada aviso.
+Opcional: datos/avisos_senamhi/avisos.csv con el título y la descripción de cada aviso, y
+          datos/avisos_senamhi/rangos.csv con los acumulados de lluvia previstos por día y zona.
 
 Uso en streamlit_app.py:
     with v_avi:
@@ -26,17 +27,24 @@ import streamlit as st
 RAIZ = Path(__file__).resolve().parents[1]
 CARPETA = RAIZ / "datos" / "avisos_senamhi"
 TITULOS = CARPETA / "avisos.csv"
+RANGOS = CARPETA / "rangos.csv"
 LIMITES = RAIZ / "datos" / "limites"
 LIMA = ZoneInfo("America/Lima")
 
 TOLERANCIA = 0.005          # grados (~550 m): simplificación de los polígonos del aviso
 MAX_BOTONES = 6             # avisos visibles como botones; el resto va en "Anteriores"
-# Departamentos que muestran provincias y distritos (los límites departamentales se ven en todo el Perú).
-DETALLE_POR_DEFECTO = ["LA LIBERTAD", "ANCASH"]
 
 # Niveles del aviso meteorológico de SENAMHI (mismos colores que el nowcasting de la pestaña Lluvia)
-NIVELES = {1: ("Verde", "#3FAE5A"), 2: ("Amarillo", "#FFE600"), 3: ("Naranja", "#FF9900"), 4: ("Rojo", "#E60000")}
-CUADRO = {0: "⬜", 1: "🟩", 2: "🟨", 3: "🟧", 4: "🟥"}
+NIVELES = {1: ("Blanco", "#F2F2F2"), 2: ("Amarillo", "#FFE600"), 3: ("Naranja", "#FF9900"), 4: ("Rojo", "#E60000")}
+CUADRO = {0: "⬜", 1: "⬜", 2: "🟨", 3: "🟧", 4: "🟥"}
+# Significado de cada nivel (resumen de la escala oficial de SENAMHI, gob.pe)
+SIGNIFICADO = {
+    1: "Sin fenómenos peligrosos. No se requieren precauciones especiales.",
+    2: "Fenómenos peligrosos pero habituales en la zona. Mantenerse informado y ser prudente.",
+    3: "Se prevén fenómenos peligrosos. Seguir las recomendaciones de las autoridades.",
+    4: "Fenómenos de gran magnitud. Extremar precauciones y seguir las indicaciones de las autoridades.",
+}
+AZUL = "#7CC6E8"
 # Regiones (departamentos) de la tabla de niveles, de norte a sur: nombre en el archivo de límites -> nombre a mostrar
 REGIONES = {"TUMBES": "Tumbes", "PIURA": "Piura", "LAMBAYEQUE": "Lambayeque", "LA LIBERTAD": "La Libertad",
             "CAJAMARCA": "Cajamarca", "ANCASH": "Áncash", "LIMA": "Lima"}
@@ -60,7 +68,7 @@ def _nivel(texto):
 
 
 def _texto_color(n):
-    return "#FFFFFF" if n in (1, 4) else FONDO
+    return "#FFFFFF" if n == 4 else FONDO
 
 
 # ------------------------------------------------------------------ lectura (con caché)
@@ -165,11 +173,18 @@ def limites(nivel, departamentos=None):
 
 
 @st.cache_data(show_spinner=False)
-def departamentos_disponibles():
-    ruta = LIMITES / "provincias.geojson"
-    if not ruta.exists():
-        return []
-    return sorted({f["properties"]["departamento"] for f in json.loads(ruta.read_text(encoding="utf-8"))["features"]})
+def rangos(firma_csv):
+    """rangos.csv (opcional): aviso, anio, fecha (AAAA-MM-DD), zona, min_mm, max_mm.
+    Si min_mm va vacío se muestra como "≈ max_mm" (p. ej. "valores cercanos a 15 mm/día")."""
+    if not firma_csv:
+        return pd.DataFrame()
+    try:
+        r = pd.read_csv(RANGOS, dtype={"zona": str}, keep_default_na=True)
+        r["fecha"] = pd.to_datetime(r["fecha"]).dt.date
+        return r
+    except Exception as e:
+        print(f"[avisos] rangos.csv no se pudo leer: {type(e).__name__}: {e}")
+        return pd.DataFrame()
 
 
 # ------------------------------------------------------------------ piezas de la vista
@@ -219,10 +234,49 @@ def _tabla_regiones(a, dia_sel):
     st.markdown(f"<table style='width:100%;border-collapse:collapse'><tr><th style='{th};text-align:left'>Región</th>{cab}</tr>{filas}</table>",
                 unsafe_allow_html=True)
     st.caption("Nivel más alto del aviso dentro de la región y porcentaje de su área con aviso (nivel 2 o más). "
-               "Nivel 1 = sin aviso.")
+               "Nivel 1 (blanco) = sin aviso.")
 
 
-def _mapa(m_dia, zonas, detalle, capas_base):
+def _leyenda():
+    """Qué significa cada nivel del aviso."""
+    items = "".join(
+        f"<div style='flex:1;min-width:160px;display:flex;gap:8px;align-items:flex-start'>"
+        f"<div style='flex:none;width:14px;height:14px;margin-top:2px;border-radius:3px;background:{color};border:1px solid {LINEA}'></div>"
+        f"<div style='font-size:12px;line-height:1.3'><b>Nivel {n} · {nombre}</b><br><span style='color:{GRIS}'>{SIGNIFICADO[n]}</span></div></div>"
+        for n, (nombre, color) in NIVELES.items())
+    st.markdown(f"<div style='display:flex;flex-wrap:wrap;gap:10px 18px;background:{PANEL};border:1px solid {LINEA};"
+                f"border-radius:10px;padding:10px 12px;margin-top:4px'>{items}</div>", unsafe_allow_html=True)
+
+
+def _lluvia_prevista(a, m_dia, tabla):
+    """Acumulados de lluvia previstos (mm/día) por zona para el día elegido, cargados en rangos.csv."""
+    st.markdown(f"**Lluvia prevista · {_fecha(m_dia['inicio'])}**")
+    if tabla.empty:
+        st.caption("Sin rangos cargados. Se agregan en `datos/avisos_senamhi/rangos.csv`.")
+        return
+    del_aviso = tabla[(tabla["aviso"] == a["aviso"]) & (tabla["anio"] == a["anio"])]
+    del_dia = del_aviso[del_aviso["fecha"] == m_dia["inicio"]]
+    if del_dia.empty:
+        st.caption("Sin rangos cargados para este día (`datos/avisos_senamhi/rangos.csv`).")
+        return
+    escala = max(float(del_aviso["max_mm"].max()), 1.0)       # misma escala para todos los días del aviso
+    filas = ""
+    for _, r in del_dia.iterrows():
+        mx = float(r["max_mm"])
+        mn = None if pd.isna(r["min_mm"]) else float(r["min_mm"])
+        texto = f"≈ {mx:g}" if mn is None else f"{mn:g} – {mx:g}"
+        x0 = (mx if mn is None else mn) / escala * 100
+        ancho = max(mx / escala * 100 - x0, 1.5)
+        barra = (f"<div style='position:relative;height:8px;background:{LINEA};border-radius:4px'>"
+                 f"<div style='position:absolute;left:{x0:.1f}%;width:{ancho:.1f}%;height:8px;background:{AZUL};border-radius:4px'></div></div>")
+        filas += (f"<tr><td style='padding:4px 8px 4px 0;font-size:13px;white-space:nowrap'>{r['zona']}</td>"
+                  f"<td style='padding:4px 8px;font-size:13px;white-space:nowrap;text-align:right'><b>{texto}</b></td>"
+                  f"<td style='padding:4px 0;width:45%'>{barra}</td></tr>")
+    st.markdown(f"<table style='width:100%;border-collapse:collapse'>{filas}</table>", unsafe_allow_html=True)
+    st.caption(f"Acumulado de lluvia en mm/día según el aviso · barras en escala de 0 a {escala:g} mm.")
+
+
+def _mapa(m_dia, zonas, capas_base):
     import folium
     from streamlit_folium import st_folium
 
@@ -243,29 +297,18 @@ def _mapa(m_dia, zonas, detalle, capas_base):
         folium.Polygon(list(poligono), color="#FFFFFF", weight=1.5, dash_array="5", fill=False, tooltip=nombre).add_to(g_z)
     g_z.add_to(mapa)
 
-    # Departamentos en un panel propio, siempre por encima del aviso, provincias y distritos:
+    # Departamentos en un panel propio, siempre por encima del aviso:
     # línea oscura con un borde claro alrededor, para que se distinga sobre cualquier mapa base.
-    folium.map.CustomPane("limite_dep", z_index=450, pointer_events=True).add_to(mapa)
-    capas = [  # (archivo, nombre, filtro, estilo, visible, campos del tooltip)
-        ("departamentos", "Departamentos", None, None, True, ["departamento"]),
-        ("provincias", "Provincias", detalle, {"color": "#C9D4DF", "weight": 1.2, "opacity": 0.9}, False, ["provincia", "departamento"]),
-        ("distritos", "Distritos", detalle, {"color": "#9FB0C0", "weight": 0.7, "opacity": 0.8, "dashArray": "3 3"}, False, ["distrito", "provincia"]),
-    ]
-    for archivo, nombre, filtro, estilo, visible, campos in capas:
-        geo = limites(archivo, filtro)
-        if not geo:
-            continue
-        if archivo == "departamentos":
-            g_dep = folium.FeatureGroup(nombre, show=visible)
-            folium.GeoJson(geo, pane="limite_dep", interactive=False,
-                           style_function=lambda _: {"fill": False, "color": "#E6EDF3", "weight": 4.5, "opacity": 0.55}).add_to(g_dep)
-            folium.GeoJson(geo, pane="limite_dep",
-                           style_function=lambda _: {"fill": False, "color": "#0B0F14", "weight": 2.2, "opacity": 1},
-                           tooltip=folium.GeoJsonTooltip(campos, labels=False)).add_to(g_dep)
-            g_dep.add_to(mapa)
-        else:
-            folium.GeoJson(geo, name=nombre, show=visible, style_function=lambda _, e=estilo: {"fill": False, **e},
-                           tooltip=folium.GeoJsonTooltip(campos, labels=False)).add_to(mapa)
+    geo = limites("departamentos")
+    if geo:
+        folium.map.CustomPane("limite_dep", z_index=450, pointer_events=True).add_to(mapa)
+        g_dep = folium.FeatureGroup("Departamentos")
+        folium.GeoJson(geo, pane="limite_dep", interactive=False,
+                       style_function=lambda _: {"fill": False, "color": "#E6EDF3", "weight": 4.5, "opacity": 0.55}).add_to(g_dep)
+        folium.GeoJson(geo, pane="limite_dep",
+                       style_function=lambda _: {"fill": False, "color": "#0B0F14", "weight": 2.2, "opacity": 1},
+                       tooltip=folium.GeoJsonTooltip(["departamento"], labels=False)).add_to(g_dep)
+        g_dep.add_to(mapa)
 
     folium.LayerControl(collapsed=False).add_to(mapa)
     st_folium(mapa, height=560, use_container_width=True, returned_objects=[])
@@ -313,14 +356,10 @@ def render_avisos_precipitacion(capas_base=None, zonas=()):
     with col_panel:
         st.markdown("**Nivel por región**")
         _tabla_regiones(a, m_dia["mapa"])
-        deps = departamentos_disponibles()
-        detalle = DETALLE_POR_DEFECTO
-        if deps:
-            detalle = st.multiselect("Provincias y distritos de", deps, default=[d for d in DETALLE_POR_DEFECTO if d in deps],
-                                     format_func=str.title, key="avisos_detalle",
-                                     help="Solo se cargan los límites de estos departamentos, para que el mapa siga liviano.")
+        st.divider()
+        _lluvia_prevista(a, m_dia, rangos(RANGOS.stat().st_mtime_ns if RANGOS.exists() else None))
         st.caption(f"Numero total de mapas cargados de este aviso: {len(a['mapas'])}" )
     with col_mapa:
-        _mapa(m_dia, zonas, tuple(detalle), capas_base)
-        st.caption("Mapa de Aviso según SENAMHI (simplificado a ~550 m) || Límites según INEI || "
-                   "Activación de provincias y distritos en el selector de capas del mapa.")
+        _mapa(m_dia, zonas, capas_base)
+        _leyenda()
+        st.caption("Mapa de Aviso según SENAMHI (simplificado a ~550 m) || Límites según INEI")
