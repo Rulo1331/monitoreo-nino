@@ -223,7 +223,7 @@ def _mapa(m_dia, zonas, encuadre, detalle, capas_base):
         "weight": 1, "fillOpacity": 0.55}, tooltip=folium.GeoJsonTooltip(["texto"], labels=False)).add_to(g_av)
     g_av.add_to(mapa)
 
-    g_z = folium.FeatureGroup("Zonas de monitoreo")
+    g_z = folium.FeatureGroup("Viru y Chao")
     for nombre, poligono in zonas:
         folium.Polygon(list(poligono), color="#FFFFFF", weight=1.5, dash_array="5", fill=False, tooltip=nombre).add_to(g_z)
     g_z.add_to(mapa)
