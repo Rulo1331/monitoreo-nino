@@ -245,7 +245,7 @@ def _mapa(m_dia, zonas, encuadre, detalle, capas_base):
 # ------------------------------------------------------------------ pestaña
 def render_avisos_precipitacion(capas_base=None, zonas=()):
     zonas = tuple((z["zona"], tuple(map(tuple, z["poligono"]))) for z in zonas)
-    st.markdown("**Avisos meteorológicos de precipitación** · SENAMHI · mapas cargados a mano en `datos/avisos_senamhi`")
+    st.markdown("**Avisos meteorológicos de precipitación** · SENAMHI")
 
     avisos, errores = cargar(_firma(), zonas)
     if errores:
@@ -292,8 +292,8 @@ def render_avisos_precipitacion(capas_base=None, zonas=()):
             detalle = st.multiselect("Provincias y distritos de", deps, default=[d for d in DETALLE_POR_DEFECTO if d in deps],
                                      format_func=str.title, key="avisos_detalle",
                                      help="Solo se cargan los límites de estos departamentos, para que el mapa siga liviano.")
-        st.caption(f"Mapas cargados de este aviso: {len(a['mapas'])} · archivos: " + ", ".join(m["archivo"] for m in a["mapas"]))
+        st.caption(f"Numero total de mapas cargados de este aviso: {len(a['mapas'])}" )
     with col_mapa:
         _mapa(m_dia, zonas, encuadre, tuple(detalle), capas_base)
-        st.caption("Aviso: SENAMHI (simplificado a ~550 m) · Límites: INEI vía peru-geojson (MPL 2.0) · "
-                   "Activa provincias y distritos en el selector de capas del mapa.")
+        st.caption("Mapa de Aviso según SENAMHI (simplificado a ~550 m) || Límites según INEI"
+                   "Activación de provincias y distritos en el selector de capas del mapa.")
